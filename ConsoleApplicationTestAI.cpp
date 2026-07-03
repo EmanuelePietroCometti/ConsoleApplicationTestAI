@@ -7,13 +7,14 @@
 #include <iostream>
 #include <thread>
 #include <tchar.h>
+#include <string>
 
 #define NUM_CONTROL_POINTS 3
 
 enum class InferenceState : WORD {
 	IDLE = 0,
-	PENDING = 1,
-	RESULT_READY = 2,
+	RESULT_READY = 1,
+	PENDING = 2,
 	ERROR_DETECTED = 4
 };
 enum class PointState : WORD {
@@ -38,7 +39,6 @@ enum class InferenceType : WORD {
 
 typedef struct resultInference {
 	InferenceState state;
-	InferenceType inferenceType;
 	DWORD sizeX;
 	DWORD sizeY;
 	TCHAR json[1024];
@@ -55,6 +55,7 @@ typedef struct controlPoint {
 	TCHAR eventReadyName[128];
 	PointState status;
 	resultInference results;
+	InferenceType inferenceType;
 } controlPoint, * PTcontrolPoint;
 
 typedef struct controlPointsList {
@@ -91,112 +92,164 @@ HANDLE hListEventAck = NULL;
 
 void controlPointThreadFunc(int i)
 {
+	// Map INPUT IMAGE (Sender -> AI)
 	int nPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY * cpListMMF->points[i].bpp / 8;
 
-	TCHAR pName[64];
-	swprintf_s(pName, 64, TEXT("MMF_%lu_IMAGE"), cpListMMF->points[i].idPunto);
-	HANDLE hMMFImage = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, nPayload, pName);
-	void* pImage = NULL;
-	DWORD dwErr = GetLastError();
-	if (dwErr == ERROR_SUCCESS || dwErr == ERROR_ALREADY_EXISTS)
-		pImage = MapViewOfFile(hMMFImage, FILE_MAP_WRITE, 0, 0, nPayload);
+	// Create dynamic wide string using standard C++
+	std::wstring pName = L"MMF_" + std::to_wstring(cpListMMF->points[i].idPunto) + L"_IMAGE";
 
-	std::cout << "Thread " << i << "th running" << std::endl;
+	HANDLE hMMFImage = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, nPayload, pName.c_str());
+	void* pImage = NULL;
+	if (hMMFImage != NULL) {
+		pImage = MapViewOfFile(hMMFImage, FILE_MAP_WRITE, 0, 0, nPayload);
+	}
+
+	// Map OUTPUT RESIMAGE (AI -> Sender)
+	int nResPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY;
+
+	// Create dynamic wide string using standard C++
+	std::wstring resName = L"MMF_" + std::to_wstring(cpListMMF->points[i].idPunto) + L"_RESIMAGE";
+
+	HANDLE hMMFResImage = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, nResPayload, resName.c_str());
+	void* pResImage = NULL;
+	if (hMMFResImage != NULL) {
+		pResImage = MapViewOfFile(hMMFResImage, FILE_MAP_READ, 0, 0, nResPayload);
+	}
+
+	std::cout << "Thread " << i << " running\n";
 
 	while (cpListMMF->points[i].status != PointState::QUIT)
 	{
-		DWORD dwWaitResult = WaitForSingleObject(
-			hControlPointMutex[i],    // handle to mutex
-			1);  // no time-out interval
+		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], 1);
 
 		switch (dwWaitResult)
 		{
-			// The thread got ownership of the mutex
 		case WAIT_OBJECT_0:
 		{
-			__try {
-				auto start = std::chrono::high_resolution_clock::now();
-
-				// Write simulated image data directly into the MMF
-				if (pImage != NULL) {
-					int nVal = rand() % 256;
-					memset(pImage, nVal, nPayload);
-				}
-				cpListMMF->points[i].results.state = InferenceState::PENDING;
-				auto end = std::chrono::high_resolution_clock::now();
-
-				auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-
-				std::cout << "Thread " << i << "th set image and event - time " << duration.count() << " us" << std::endl;
-
-			}
-
-			__finally {
-				// Release ownership of the mutex object
-				std::cout << "Thread " << i << "th release mutex" << std::endl;
-				if (!ReleaseMutex(hControlPointMutex[i]))
-				{
-					std::cout << "### Thread " << i << "th release mutex error" << std::endl;
-				}
-			}
 			auto start = std::chrono::high_resolution_clock::now();
+
+			if (pImage != NULL) {
+				uint8_t* pPixels = static_cast<uint8_t*>(pImage);
+				for (int p = 0; p < nPayload; p++) {
+					pPixels[p] = static_cast<uint8_t>(p % 2);
+				}
+			}
+	
+			// Set the PENDING state for correct IPC synchronization
+			cpListMMF->points[i].results.state = InferenceState::PENDING;
+
+			auto end = std::chrono::high_resolution_clock::now();
+			auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+			std::cout << "Thread " << i << " set image and event - time " << duration.count() << " us\n";
+
+			// Manual safe release of the mutex 
+			if (!ReleaseMutex(hControlPointMutex[i])) {
+				std::cerr << "### Thread " << i << " release mutex error\n";
+			}
+
+			ResetEvent(hControlPointResults[i]);
+
+			// Signal AI to start inference
+			start = std::chrono::high_resolution_clock::now();
 			SetEvent(hControlPointEvent[i]);
 
+			// Wait for AI results (2000 ms timeout)
 			DWORD resWait = WaitForSingleObject(hControlPointResults[i], 2000);
 
 			if (resWait == WAIT_OBJECT_0) {
-
-
 				DWORD mutexWait = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 				if (mutexWait == WAIT_OBJECT_0) {
-					__try {
-						// Verify that the inference finished successfully
-						if (cpListMMF->points[i].results.state == InferenceState::RESULT_READY) {
-							auto end = std::chrono::high_resolution_clock::now();
-							auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+					// Verify that the inference finished successfully
+					if (cpListMMF->points[i].results.state == InferenceState::RESULT_READY) {
+						end = std::chrono::high_resolution_clock::now();
+						auto inf_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-							// Process the JSON output 
-							std::wcout << TEXT(">> POINT ") << i << TEXT(" AI RESULT [")
-								<< duration.count() << TEXT(" ms]: ")
-								<< cpListMMF->points[i].results.json << std::endl;
+						// JSON extraction and parsing
+						std::wstring jsonW(cpListMMF->points[i].results.json);
+						float anomalyScore = -1.0f;
+						std::wstring status = L"UNKNOWN";
 
-							// Acknowledge reading by setting state back to IDLE
-							cpListMMF->points[i].results.state = InferenceState::IDLE;
+						// Search anomaly score
+						std::wstring scoreKey = L"\"anomaly_score\":";
+						size_t scorePos = jsonW.find(scoreKey);
+						if (scorePos != std::wstring::npos) {
+							size_t valStart = scorePos + scoreKey.length();
+							try {
+								anomalyScore = std::stof(jsonW.substr(valStart));
+							}
+							catch (const std::exception&) {
+								std::wcerr << L"### POINT " << i << L" Errore di conversione anomaly_score!\n";
+							}
 						}
-						// Handle potential errors reported by the TensorRT engine
-						else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
-							std::wcout << TEXT("### POINT ") << i << TEXT(" AI ERROR DETECTED!") << std::endl;
+
+						// Search keyword status
+						std::wstring statusKey = L"\"status\": \"";
+						size_t statusPos = jsonW.find(statusKey);
+						if (statusPos != std::wstring::npos) {
+							size_t valStart = statusPos + statusKey.length();
+							size_t valEnd = jsonW.find(L"\"", valStart);
+							if (valEnd != std::wstring::npos) {
+								status = jsonW.substr(valStart, valEnd - valStart);
+							}
 						}
+
+						std::wcout << L">> POINT " << i << L" AI RESULT [" << inf_duration.count() << L" ms] -> "
+							<< L"Score: " << anomalyScore << L" | Status: " << status << L"\n";
+
+						// ANOMALY MAP extraction and memcmp validation
+						if (pResImage != NULL && cpListMMF->points[i].inferenceType == InferenceType::ANOMALY) {
+
+							int nResPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY;
+
+							// Generate the expected 0, 1, 0, 1 pattern locally
+							std::vector<uint8_t> expectedPattern(nResPayload);
+							for (int p = 0; p < nResPayload; p++) {
+								expectedPattern[p] = static_cast<uint8_t>(p % 2);
+							}
+
+							// Perform byte-by-byte memory comparison
+							if (memcmp(pResImage, expectedPattern.data(), nResPayload) == 0) {
+								std::wcout << L"   --> IPC TEST PASSED: _RESIMAGE memcmp success ("
+									<< nResPayload << L" bytes match 100%)!\n";
+							}
+							else {
+								std::wcerr << L"   ### IPC TEST FAILED: _RESIMAGE memory mismatch!\n";
+							}
+						}
+
+						// Acknowledge reading by setting state back to IDLE
+						cpListMMF->points[i].results.state = InferenceState::IDLE;
 					}
-					__finally {
-						ReleaseMutex(hControlPointMutex[i]);
+					// Handle potential errors reported by the TensorRT engine
+					else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
+						std::wcerr << L"### POINT " << i << L" AI ERROR DETECTED!\n";
 					}
+					ReleaseMutex(hControlPointMutex[i]);
 				}
 			}
 			else if (resWait == WAIT_TIMEOUT) {
-				std::wcout << TEXT("### POINT ") << i << TEXT(" AI TIMEOUT ERROR!") << std::endl;
+				std::wcerr << L"### POINT " << i << L" AI TIMEOUT ERROR!\n";
 			}
 			break;
-
-			// The thread got ownership of an abandoned mutex
-			// The database is in an indeterminate state
 		}
 		case WAIT_TIMEOUT:
-		{
-			std::cout << "@@@ Thread " << i << "is waiting for mutex..." << std::endl;
+			std::cout << "@@@ Thread " << i << " is waiting for mutex...\n";
 			break;
-			// The thread got ownership of an abandoned mutex
-					// The database is in an indeterminate state
-		}
 		case WAIT_ABANDONED:
 			break;
-
 		}
 
+		// Throttle cycle to simulate camera trigger delay
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
+
+	// Resource cleanup to prevent severe memory leaks
 	if (pImage) UnmapViewOfFile(pImage);
 	if (hMMFImage) CloseHandle(hMMFImage);
+
+	if (pResImage) UnmapViewOfFile(pResImage);
+	if (hMMFResImage) CloseHandle(hMMFResImage);
 
 	std::cout << "Thread " << i << " stopped!\n";
 }
@@ -331,6 +384,7 @@ void Configure()
 			createEvent(hControlPointEvent[i], i, L"EVENTREADY");
 			createEvent(hControlPointResults[i], i, L"EVENTRESULTS");
 
+			cpListMMF->points[i].inferenceType = InferenceType::ANOMALY;
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
@@ -428,40 +482,43 @@ int main()
 	bool isRunning = true;
 	while (isRunning)
 	{
-		char c = _getch();
-		switch (c)
+		if (_kbhit())
 		{
-		case 'c':
-		{
-			Configure();
-			break;
-		}
-		case 's':
-		{
-			bool isConfigured = false;
-			WaitForSingleObject(hListMutex, INFINITE);
-			if (cpListMMF->state == ListState::CONFIGURED) {
-				isConfigured = true;
+			char c = _getch();
+
+			switch (c)
+			{
+			case 'c':
+				Configure();
+				break;
+
+			case 's':
+			{
+				bool isConfigured = false;
+				WaitForSingleObject(hListMutex, INFINITE);
+				if (cpListMMF->state == ListState::CONFIGURED) {
+					isConfigured = true;
+				}
+				ReleaseMutex(hListMutex);
+
+				if (isConfigured) {
+					Start();
+				}
+				else {
+					std::cout << "### ERROR: Configure before starting!" << std::endl;
+				}
+				break;
 			}
-			ReleaseMutex(hListMutex);
-			if (isConfigured)
-				Start();
-			else
-				std::cout << "### Configure before start" << std::endl;
-			break;
-		}
-		
-		case 'q':
-		{
-			std::cout << "Initiating shutdwon sequence..." << std::endl;
-			Quit();
-			break;
-		}
-		
-		default:
-		{
-			break;
-		}
+
+			case 'q':
+				std::cout << "Initiating shutdown sequence..." << std::endl;
+				Quit();
+				break;
+
+			default:
+				// Ignore any other key presses
+				break;
+			}
 		}
 		DWORD resWait = WaitForSingleObject(hListMutex, 10);
 		switch (resWait) {
