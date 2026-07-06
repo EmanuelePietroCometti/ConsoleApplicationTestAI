@@ -107,7 +107,7 @@ void controlPointThreadFunc(int i)
 	// Map OUTPUT RESIMAGE (AI -> Sender)
 	int nResPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY;
 
-	// Create dynamic wide string using standard C++
+	// Create dynamic wide string
 	std::wstring resName = L"MMF_" + std::to_wstring(cpListMMF->points[i].idPunto) + L"_RESIMAGE";
 
 	HANDLE hMMFResImage = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, nResPayload, resName.c_str());
@@ -118,118 +118,88 @@ void controlPointThreadFunc(int i)
 
 	std::cout << "Thread " << i << " running\n";
 
+	// Simulated camera trigger
+	const int CAMERA_FPS = 25;
+	const auto cameraInterval = std::chrono::milliseconds(1000 / CAMERA_FPS);
+
 	while (cpListMMF->points[i].status != PointState::QUIT)
 	{
-		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], 1);
+		auto loop_start = std::chrono::high_resolution_clock::now();
+
+		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 
 		switch (dwWaitResult)
 		{
 		case WAIT_OBJECT_0:
 		{
-			auto start = std::chrono::high_resolution_clock::now();
-
-			if (pImage != NULL) {
-				uint8_t* pPixels = static_cast<uint8_t*>(pImage);
-				for (int p = 0; p < nPayload; p++) {
-					pPixels[p] = static_cast<uint8_t>(p % 2);
-				}
+			// Frame dropping
+			// If state is PENDING, the AI has not finished processing the previous frame.
+			if (cpListMMF->points[i].results.state == InferenceState::PENDING) {
+				std::cerr << "### WARNING: FRAME DROP DETECTED ON CP " << i
+					<< "! AI is too slow for " << CAMERA_FPS << " FPS.\n";
 			}
-	
-			// Set the PENDING state for correct IPC synchronization
-			cpListMMF->points[i].results.state = InferenceState::PENDING;
+			else
+			{
+				// If available, read preavious result
+				if (cpListMMF->points[i].results.state == InferenceState::RESULT_READY) {
 
-			auto end = std::chrono::high_resolution_clock::now();
-			auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+					std::wstring jsonW(cpListMMF->points[i].results.json);
+					float anomalyScore = -1.0f;
+					std::wstring status = L"UNKNOWN";
 
-			std::cout << "Thread " << i << " set image and event - time " << duration.count() << " us\n";
+					// Parse anomaly score
+					std::wstring scoreKey = L"\"anomaly_score\":";
+					size_t scorePos = jsonW.find(scoreKey);
+					if (scorePos != std::wstring::npos) {
+						try {
+							anomalyScore = std::stof(jsonW.substr(scorePos + scoreKey.length()));
+						}
+						catch (const std::invalid_argument& e) {
+							std::wcerr << L"### ERROR CP " << i << L": anomaly_score non è un numero valido (JSON malformato)!\n";
+						}
+						catch (const std::out_of_range& e) {
+							std::wcerr << L"### ERROR CP " << i << L": anomaly_score fuori range per un float!\n";
+						}
+					}
 
-			// Manual safe release of the mutex 
+					// Parse status
+					std::wstring statusKey = L"\"status\": \"";
+					size_t statusPos = jsonW.find(statusKey);
+					if (statusPos != std::wstring::npos) {
+						size_t valStart = statusPos + statusKey.length();
+						size_t valEnd = jsonW.find(L"\"", valStart);
+						if (valEnd != std::wstring::npos) {
+							status = jsonW.substr(valStart, valEnd - valStart);
+						}
+					}
+
+					std::wcout << L">> POINT " << i << L" AI RESULT -> Score: "
+						<< anomalyScore << L" | Status: " << status << L"\n";
+
+					// Set state back to IDLE to acknowledge data reception
+					cpListMMF->points[i].results.state = InferenceState::IDLE;
+				}
+				else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
+					std::wcerr << L"### POINT " << i << L" AI ERROR DETECTED!\n";
+				}
+
+				// Generate new frame
+				if (pImage != NULL) {
+					uint8_t* pPixels = static_cast<uint8_t*>(pImage);
+					for (int p = 0; p < nPayload; p++) {
+						pPixels[p] = static_cast<uint8_t>(p % 2); // Simulated test pattern
+					}
+				}
+
+				// trigger AI
+				cpListMMF->points[i].results.state = InferenceState::PENDING;
+				ResetEvent(hControlPointResults[i]);
+				SetEvent(hControlPointEvent[i]);
+			}
+
+			// Always safely release the mutex so the AI can lock it
 			if (!ReleaseMutex(hControlPointMutex[i])) {
 				std::cerr << "### Thread " << i << " release mutex error\n";
-			}
-
-			ResetEvent(hControlPointResults[i]);
-
-			// Signal AI to start inference
-			start = std::chrono::high_resolution_clock::now();
-			SetEvent(hControlPointEvent[i]);
-
-			// Wait for AI results (2000 ms timeout)
-			DWORD resWait = WaitForSingleObject(hControlPointResults[i], 2000);
-
-			if (resWait == WAIT_OBJECT_0) {
-				DWORD mutexWait = WaitForSingleObject(hControlPointMutex[i], INFINITE);
-				if (mutexWait == WAIT_OBJECT_0) {
-					// Verify that the inference finished successfully
-					if (cpListMMF->points[i].results.state == InferenceState::RESULT_READY) {
-						end = std::chrono::high_resolution_clock::now();
-						auto inf_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-						// JSON extraction and parsing
-						std::wstring jsonW(cpListMMF->points[i].results.json);
-						float anomalyScore = -1.0f;
-						std::wstring status = L"UNKNOWN";
-
-						// Search anomaly score
-						std::wstring scoreKey = L"\"anomaly_score\":";
-						size_t scorePos = jsonW.find(scoreKey);
-						if (scorePos != std::wstring::npos) {
-							size_t valStart = scorePos + scoreKey.length();
-							try {
-								anomalyScore = std::stof(jsonW.substr(valStart));
-							}
-							catch (const std::exception&) {
-								std::wcerr << L"### POINT " << i << L" Errore di conversione anomaly_score!\n";
-							}
-						}
-
-						// Search keyword status
-						std::wstring statusKey = L"\"status\": \"";
-						size_t statusPos = jsonW.find(statusKey);
-						if (statusPos != std::wstring::npos) {
-							size_t valStart = statusPos + statusKey.length();
-							size_t valEnd = jsonW.find(L"\"", valStart);
-							if (valEnd != std::wstring::npos) {
-								status = jsonW.substr(valStart, valEnd - valStart);
-							}
-						}
-
-						std::wcout << L">> POINT " << i << L" AI RESULT [" << inf_duration.count() << L" ms] -> "
-							<< L"Score: " << anomalyScore << L" | Status: " << status << L"\n";
-
-						// ANOMALY MAP extraction and memcmp validation
-						if (pResImage != NULL && cpListMMF->points[i].inferenceType == InferenceType::ANOMALY) {
-
-							int nResPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY;
-
-							// Generate the expected 0, 1, 0, 1 pattern locally
-							std::vector<uint8_t> expectedPattern(nResPayload);
-							for (int p = 0; p < nResPayload; p++) {
-								expectedPattern[p] = static_cast<uint8_t>(p % 2);
-							}
-
-							// Perform byte-by-byte memory comparison
-							if (memcmp(pResImage, expectedPattern.data(), nResPayload) == 0) {
-								std::wcout << L"   --> IPC TEST PASSED: _RESIMAGE memcmp success ("
-									<< nResPayload << L" bytes match 100%)!\n";
-							}
-							else {
-								std::wcerr << L"   ### IPC TEST FAILED: _RESIMAGE memory mismatch!\n";
-							}
-						}
-
-						// Acknowledge reading by setting state back to IDLE
-						cpListMMF->points[i].results.state = InferenceState::IDLE;
-					}
-					// Handle potential errors reported by the TensorRT engine
-					else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
-						std::wcerr << L"### POINT " << i << L" AI ERROR DETECTED!\n";
-					}
-					ReleaseMutex(hControlPointMutex[i]);
-				}
-			}
-			else if (resWait == WAIT_TIMEOUT) {
-				std::wcerr << L"### POINT " << i << L" AI TIMEOUT ERROR!\n";
 			}
 			break;
 		}
@@ -240,8 +210,15 @@ void controlPointThreadFunc(int i)
 			break;
 		}
 
-		// Throttle cycle to simulate camera trigger delay
-		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		// HARDWARE TRIGGER SIMULATION (THROTTLING)
+		// Calculate how long this iteration took and sleep the remaining time 
+		// to strictly enforce the target FPS.
+		auto loop_end = std::chrono::high_resolution_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(loop_end - loop_start);
+
+		if (elapsed < cameraInterval) {
+			std::this_thread::sleep_for(cameraInterval - elapsed);
+		}
 	}
 
 	// Resource cleanup to prevent severe memory leaks
@@ -354,13 +331,10 @@ void createEvent(HANDLE& hEvent, int i, const std::wstring& suffix) {
 
 void Configure()
 {
-	DWORD globalWaitResult = WaitForSingleObject(
-		hListMutex,		// handle to mutex
-		INFINITE);		// no time-out interval
+	DWORD globalWaitResult = WaitForSingleObject(hListMutex, INFINITE);
 
 	switch (globalWaitResult)
 	{
-		// The thread got ownership of the mutex
 	case WAIT_OBJECT_0:
 	{
 		cpListMMF->state = ListState::UPDATE_PENDING;
@@ -368,13 +342,16 @@ void Configure()
 		ZeroMemory(cpListMMF->points, sizeof(controlPoint) * 1024);
 		cpListMMF->numPunti = NUM_CONTROL_POINTS;
 		DWORD nRand = rand();
+
 		for (int i = 0; i < NUM_CONTROL_POINTS; i++)
 		{
 			cpListMMF->points[i].idPunto = nRand + i;
 			cpListMMF->points[i].sizeX = 512;
 			cpListMMF->points[i].sizeY = 512;
 			cpListMMF->points[i].bpp = 24;
-			wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:\\modello.onnx"));
+
+			// Specific path for your EfficientAD model
+			wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:/emanuele/Code/anomaly_detection_for_textile_industry/exports/efficientad_onnx/weights/onnx/26062026_083600_dustOnValidationAndTrain_EfficientAd_wide_resnet50_2.onnx"));
 
 			swprintf_s(cpListMMF->points[i].mutexName, 128, TEXT("CP_%lu_MUTEX"), cpListMMF->points[i].idPunto);
 			swprintf_s(cpListMMF->points[i].eventReadyName, 128, TEXT("CP_%lu_EVENTREADY"), cpListMMF->points[i].idPunto);
@@ -388,22 +365,50 @@ void Configure()
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
-		// Release ownership of the mutex object manually without __finally
 		std::cout << "Release the global mutex " << std::endl;
 		if (!ReleaseMutex(hListMutex))
 		{
 			std::cout << "### Release global mutex error" << std::endl;
 		}
+
+		// Notify the AI to start configuration (and TensorRT warmup)
 		SetEvent(hListEventTrigger);
 
-		DWORD ackWait = WaitForSingleObject(hListEventAck, 3000);
-		if (ackWait == WAIT_TIMEOUT) {
-			std::wcout << "### ERROR: ONNX manager not reachable!" << std::endl;
-			cpListMMF->state = ListState::IDLE;
-			ReleaseMutex(hListMutex);
-			break;
+		std::wcout << L">> Waiting for AI engine configuration..." << std::endl;
+		std::wcout << L">> [NOTE: First-time TensorRT optimization takes time. Press 'q' to abort]" << std::endl;
+
+		bool ackReceived = false;
+		bool abortRequested = false;
+
+		// Continuous loop that keeps the UI unlocked
+		while (!ackReceived && !abortRequested) {
+
+			// Microscopic timeout to avoid CPU saturation
+			DWORD ackWait = WaitForSingleObject(hListEventAck, 100);
+
+			if (ackWait == WAIT_OBJECT_0) {
+				// The AI has completed TensorRT warmup
+				ackReceived = true;
+			}
+			else if (ackWait == WAIT_TIMEOUT) {
+				// Constantly intercept keyboard input
+				if (_kbhit()) {
+					char c = _getch();
+					if (c == 'q') {
+						abortRequested = true;
+					}
+				}
+			}
 		}
 
+		// If 'q' was pressed, interrupt cleanly and immediately
+		if (abortRequested) {
+			std::wcout << L"### WARNING: Configuration interrupted by user. Initiating shutdown..." << std::endl;
+			Quit();
+			return;
+		}
+
+		// Verify that each point is correctly initialized
 		int correctlyConfigured = 0;
 		for (int j = 0; j < NUM_CONTROL_POINTS; j++) {
 			WaitForSingleObject(hControlPointMutex[j], INFINITE);
@@ -413,35 +418,29 @@ void Configure()
 			ReleaseMutex(hControlPointMutex[j]);
 		}
 
+		// Update the global state
+		WaitForSingleObject(hListMutex, INFINITE);
 		if (correctlyConfigured == 0) {
-			WaitForSingleObject(hListMutex, INFINITE);
 			cpListMMF->state = ListState::CONFIGURED;
-			ReleaseMutex(hListMutex);
 			std::cout << "Configuration control points completed!" << std::endl;
 		}
 		else {
-			WaitForSingleObject(hListMutex, INFINITE);
 			cpListMMF->state = ListState::ERROR_DETECTED;
-			ReleaseMutex(hListMutex);
 			std::cout << "### ERROR: control points configuration failed." << std::endl;
 		}
-		break;
+		ReleaseMutex(hListMutex);
 
-		// The thread got ownership of an abandoned mutex
-		// The database is in an indeterminate state
+		break;
 	}
 	case WAIT_TIMEOUT:
 	{
 		std::cout << "Main thread waiting for the global mutex!" << std::endl;
 		break;
-		// The thread got ownership of an abandoned mutex
-		// The database is in an indeterminate state
 	}
 	case WAIT_ABANDONED:
 	{
 		break;
 	}
-
 	}
 }
 
@@ -489,9 +488,20 @@ int main()
 			switch (c)
 			{
 			case 'c':
+			{
 				Configure();
+				bool isConfigured = false;
+				WaitForSingleObject(hListMutex, INFINITE);
+				if (cpListMMF->state == ListState::CONFIGURED) {
+					isConfigured = true;
+				}
+				ReleaseMutex(hListMutex);
+				if (!isConfigured) {
+					std::cout << "### ERROR: Configuration failed before...starting shutdown!" << std::endl;
+					Quit();
+				}
 				break;
-
+			}
 			case 's':
 			{
 				bool isConfigured = false;
@@ -520,7 +530,7 @@ int main()
 				break;
 			}
 		}
-		DWORD resWait = WaitForSingleObject(hListMutex, 10);
+		DWORD resWait = WaitForSingleObject(hListMutex, 100);
 		switch (resWait) {
 			case WAIT_OBJECT_0: 
 			{
