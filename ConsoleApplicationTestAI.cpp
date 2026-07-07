@@ -89,15 +89,11 @@ HANDLE hListMutex = NULL;
 HANDLE hListEventTrigger = NULL;
 HANDLE hListEventAck = NULL;
 
-
 void controlPointThreadFunc(int i)
 {
 	// Map INPUT IMAGE (Sender -> AI)
 	int nPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY * cpListMMF->points[i].bpp / 8;
-
-	// Create dynamic wide string using standard C++
 	std::wstring pName = L"MMF_" + std::to_wstring(cpListMMF->points[i].idPunto) + L"_IMAGE";
-
 	HANDLE hMMFImage = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, nPayload, pName.c_str());
 	void* pImage = NULL;
 	if (hMMFImage != NULL) {
@@ -106,125 +102,113 @@ void controlPointThreadFunc(int i)
 
 	// Map OUTPUT RESIMAGE (AI -> Sender)
 	int nResPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY;
-
-	// Create dynamic wide string
 	std::wstring resName = L"MMF_" + std::to_wstring(cpListMMF->points[i].idPunto) + L"_RESIMAGE";
-
 	HANDLE hMMFResImage = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, nResPayload, resName.c_str());
 	void* pResImage = NULL;
 	if (hMMFResImage != NULL) {
 		pResImage = MapViewOfFile(hMMFResImage, FILE_MAP_READ, 0, 0, nResPayload);
 	}
 
-	std::cout << "Thread " << i << " running\n";
+	std::cout << "Thread " << i << " running (Simulating Hardware Frame Grabber)\n";
 
-	// Simulated camera trigger
-	const int CAMERA_FPS = 25;
-	const auto cameraInterval = std::chrono::milliseconds(1000 / CAMERA_FPS);
+	// HARDWARE TRIGGER SIMULATION: Strict 10ms interval (100 FPS)
+	const auto hardwareTriggerInterval = std::chrono::milliseconds(50);
+	auto next_trigger_time = std::chrono::high_resolution_clock::now() + hardwareTriggerInterval;
 
-	while (cpListMMF->points[i].status != PointState::QUIT)
+	bool keepRunning = true;
+
+	while (keepRunning)
 	{
-		auto loop_start = std::chrono::high_resolution_clock::now();
+		// Wait until the exact absolute time of the next hardware frame interrupt
+		std::this_thread::sleep_until(next_trigger_time);
 
+		// Advance the strict clock mathematically, avoiding any relative drift
+		next_trigger_time += hardwareTriggerInterval;
+
+		// HW INTERRUPT ARRIVED! Lock the IPC memory to communicate with AI
 		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 
-		switch (dwWaitResult)
+		if (dwWaitResult == WAIT_OBJECT_0)
 		{
-		case WAIT_OBJECT_0:
-		{
-			// Frame dropping
-			// If state is PENDING, the AI has not finished processing the previous frame.
-			if (cpListMMF->points[i].results.state == InferenceState::PENDING) {
-				std::cerr << "### WARNING: FRAME DROP DETECTED ON CP " << i
-					<< "! AI is too slow for " << CAMERA_FPS << " FPS.\n";
+			// SAFE QUIT CHECK: Evaluated securely inside the locked mutex
+			if (cpListMMF->points[i].status == PointState::QUIT) {
+				keepRunning = false;
 			}
 			else
 			{
-				// If available, read preavious result
-				if (cpListMMF->points[i].results.state == InferenceState::RESULT_READY) {
+				// FRAME DROPPING LOGIC
+				if (cpListMMF->points[i].results.state == InferenceState::PENDING) {
+					// The AI is still holding PENDING state. It hasn't finished the previous frame.
+					// In a real environment, we MUST drop this incoming camera frame to avoid memory corruption.
+					std::cerr << "### WARNING: FRAME DROP DETECTED ON CP " << i
+						<< "! AI execution exceeded 10ms.\n";
+				}
+				else
+				{
+					// READ RESULTS OF THE PREVIOUS FRAME (If available)
+					if (cpListMMF->points[i].results.state == InferenceState::RESULT_READY) {
 
-					std::wstring jsonW(cpListMMF->points[i].results.json);
-					float anomalyScore = -1.0f;
-					std::wstring status = L"UNKNOWN";
+						std::wstring jsonW(cpListMMF->points[i].results.json);
+						float anomalyScore = -1.0f;
+						std::wstring status = L"UNKNOWN";
 
-					// Parse anomaly score
-					std::wstring scoreKey = L"\"anomaly_score\":";
-					size_t scorePos = jsonW.find(scoreKey);
-					if (scorePos != std::wstring::npos) {
-						try {
-							anomalyScore = std::stof(jsonW.substr(scorePos + scoreKey.length()));
+						// Parse anomaly score
+						std::wstring scoreKey = L"\"anomaly_score\":";
+						size_t scorePos = jsonW.find(scoreKey);
+						if (scorePos != std::wstring::npos) {
+							try {
+								anomalyScore = std::stof(jsonW.substr(scorePos + scoreKey.length()));
+							}
+							catch (const std::invalid_argument& e) {
+								std::wcerr << L"### ERROR CP " << i << L": " << e.what() <<  std::endl;
+							}
+							catch (const std::out_of_range& e) {
+								std::wcerr << L"### ERROR CP " << i << L": " << e.what() << std::endl;
+							}
 						}
-						catch (const std::invalid_argument& e) {
-							std::wcerr << L"### ERROR CP " << i << L": anomaly_score non è un numero valido (JSON malformato)!\n";
+
+						// Parse status
+						std::wstring statusKey = L"\"status\": \"";
+						size_t statusPos = jsonW.find(statusKey);
+						if (statusPos != std::wstring::npos) {
+							size_t valStart = statusPos + statusKey.length();
+							size_t valEnd = jsonW.find(L"\"", valStart);
+							if (valEnd != std::wstring::npos) {
+								status = jsonW.substr(valStart, valEnd - valStart);
+							}
 						}
-						catch (const std::out_of_range& e) {
-							std::wcerr << L"### ERROR CP " << i << L": anomaly_score fuori range per un float!\n";
+
+						std::wcout << L">> POINT " << i << L" AI RESULT -> Score: "
+							<< anomalyScore << L" | Status: " << status << L"\n";
+					}
+					else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
+						std::wcerr << L"### POINT " << i << L" AI ERROR DETECTED!\n";
+					}
+
+					// WRITE THE NEW FRAME INTO SHARED MEMORY
+					if (pImage != NULL) {
+						uint8_t* pPixels = static_cast<uint8_t*>(pImage);
+						for (int p = 0; p < nPayload; p++) {
+							pPixels[p] = static_cast<uint8_t>(p % 2);
 						}
 					}
 
-					// Parse status
-					std::wstring statusKey = L"\"status\": \"";
-					size_t statusPos = jsonW.find(statusKey);
-					if (statusPos != std::wstring::npos) {
-						size_t valStart = statusPos + statusKey.length();
-						size_t valEnd = jsonW.find(L"\"", valStart);
-						if (valEnd != std::wstring::npos) {
-							status = jsonW.substr(valStart, valEnd - valStart);
-						}
-					}
-
-					std::wcout << L">> POINT " << i << L" AI RESULT -> Score: "
-						<< anomalyScore << L" | Status: " << status << L"\n";
-
-					// Set state back to IDLE to acknowledge data reception
-					cpListMMF->points[i].results.state = InferenceState::IDLE;
+					// TRIGGER AI ENGINE FOR THE NEW FRAME
+					cpListMMF->points[i].results.state = InferenceState::PENDING;
+					ResetEvent(hControlPointResults[i]);
+					SetEvent(hControlPointEvent[i]);
 				}
-				else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
-					std::wcerr << L"### POINT " << i << L" AI ERROR DETECTED!\n";
-				}
-
-				// Generate new frame
-				if (pImage != NULL) {
-					uint8_t* pPixels = static_cast<uint8_t*>(pImage);
-					for (int p = 0; p < nPayload; p++) {
-						pPixels[p] = static_cast<uint8_t>(p % 2); // Simulated test pattern
-					}
-				}
-
-				// trigger AI
-				cpListMMF->points[i].results.state = InferenceState::PENDING;
-				ResetEvent(hControlPointResults[i]);
-				SetEvent(hControlPointEvent[i]);
 			}
 
 			// Always safely release the mutex so the AI can lock it
 			if (!ReleaseMutex(hControlPointMutex[i])) {
 				std::cerr << "### Thread " << i << " release mutex error\n";
 			}
-			break;
-		}
-		case WAIT_TIMEOUT:
-			std::cout << "@@@ Thread " << i << " is waiting for mutex...\n";
-			break;
-		case WAIT_ABANDONED:
-			break;
-		}
-
-		// HARDWARE TRIGGER SIMULATION (THROTTLING)
-		// Calculate how long this iteration took and sleep the remaining time 
-		// to strictly enforce the target FPS.
-		auto loop_end = std::chrono::high_resolution_clock::now();
-		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(loop_end - loop_start);
-
-		if (elapsed < cameraInterval) {
-			std::this_thread::sleep_for(cameraInterval - elapsed);
 		}
 	}
 
-	// Resource cleanup to prevent severe memory leaks
 	if (pImage) UnmapViewOfFile(pImage);
 	if (hMMFImage) CloseHandle(hMMFImage);
-
 	if (pResImage) UnmapViewOfFile(pResImage);
 	if (hMMFResImage) CloseHandle(hMMFResImage);
 
@@ -329,8 +313,9 @@ void createEvent(HANDLE& hEvent, int i, const std::wstring& suffix) {
 	}
 }
 
-void Configure()
+bool Configure()
 {
+	bool isConfigured = false;
 	DWORD globalWaitResult = WaitForSingleObject(hListMutex, INFINITE);
 
 	switch (globalWaitResult)
@@ -405,27 +390,16 @@ void Configure()
 		if (abortRequested) {
 			std::wcout << L"### WARNING: Configuration interrupted by user. Initiating shutdown..." << std::endl;
 			Quit();
-			return;
-		}
-
-		// Verify that each point is correctly initialized
-		int correctlyConfigured = 0;
-		for (int j = 0; j < NUM_CONTROL_POINTS; j++) {
-			WaitForSingleObject(hControlPointMutex[j], INFINITE);
-			if (cpListMMF->points[j].status != PointState::CONFIGURED) {
-				correctlyConfigured = 1;
-			}
-			ReleaseMutex(hControlPointMutex[j]);
+			return false;
 		}
 
 		// Update the global state
 		WaitForSingleObject(hListMutex, INFINITE);
-		if (correctlyConfigured == 0) {
-			cpListMMF->state = ListState::CONFIGURED;
+		if (cpListMMF->state == ListState::CONFIGURED) {
 			std::cout << "Configuration control points completed!" << std::endl;
+			isConfigured = true;
 		}
 		else {
-			cpListMMF->state = ListState::ERROR_DETECTED;
 			std::cout << "### ERROR: control points configuration failed." << std::endl;
 		}
 		ReleaseMutex(hListMutex);
@@ -442,6 +416,7 @@ void Configure()
 		break;
 	}
 	}
+	return isConfigured;
 }
 
 int main()
@@ -479,6 +454,7 @@ int main()
 	std::cout << "Press 'q' to quit, press 'c' to configure, press 's' to start sim" << std::endl;
 
 	bool isRunning = true;
+	bool isConfigured = false;
 	while (isRunning)
 	{
 		if (_kbhit())
@@ -489,28 +465,15 @@ int main()
 			{
 			case 'c':
 			{
-				Configure();
-				bool isConfigured = false;
-				WaitForSingleObject(hListMutex, INFINITE);
-				if (cpListMMF->state == ListState::CONFIGURED) {
-					isConfigured = true;
-				}
-				ReleaseMutex(hListMutex);
+				isConfigured = Configure();
 				if (!isConfigured) {
-					std::cout << "### ERROR: Configuration failed before...starting shutdown!" << std::endl;
+					std::cout << "### ERROR: Configuration failed...starting shutdown!" << std::endl;
 					Quit();
 				}
 				break;
 			}
 			case 's':
 			{
-				bool isConfigured = false;
-				WaitForSingleObject(hListMutex, INFINITE);
-				if (cpListMMF->state == ListState::CONFIGURED) {
-					isConfigured = true;
-				}
-				ReleaseMutex(hListMutex);
-
 				if (isConfigured) {
 					Start();
 				}
