@@ -8,6 +8,10 @@
 #include <thread>
 #include <tchar.h>
 #include <string>
+#include <filesystem>
+#include <opencv2/opencv.hpp>
+#include <vector>
+#include <algorithm>
 
 #define NUM_CONTROL_POINTS 3
 
@@ -109,87 +113,121 @@ void controlPointThreadFunc(int i)
 		pResImage = MapViewOfFile(hMMFResImage, FILE_MAP_READ, 0, 0, nResPayload);
 	}
 
-	std::cout << "Thread " << i << " running (Simulating Hardware Frame Grabber)\n";
+	// --- NEW: Load image paths from the input folder ---
+	// Update this path to point to your actual test dataset folder
+	std::string inputFolder = "D:\\emanuele\\Code\\ConsoleApplicationTestAI\\dataset";
+	std::vector<std::string> imagePaths;
 
-	// HARDWARE TRIGGER SIMULATION: Strict 10ms interval (100 FPS)
-	const auto hardwareTriggerInterval = std::chrono::milliseconds(50);
+	try {
+		for (const auto& entry : std::filesystem::recursive_directory_iterator(inputFolder)) {
+			if (entry.is_regular_file()) {
+				std::string ext = entry.path().extension().string();
+				std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+				if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
+					imagePaths.push_back(entry.path().string());
+				}
+			}
+		}
+	}
+	catch (const std::exception& e) {
+		std::cerr << "### ERROR reading directory: " << e.what() << "\n";
+	}
+
+	std::cout << "Thread " << i << " running (Simulating Frame Grabber). Loaded " << imagePaths.size() << " images.\n";
+
+	int imageIndex = 0;
+	std::string lastSentFilename = "NONE";
+
+	// HARDWARE TRIGGER SIMULATION: Strict 100ms interval (10 FPS)
+	const auto hardwareTriggerInterval = std::chrono::milliseconds(100);
 	auto next_trigger_time = std::chrono::high_resolution_clock::now() + hardwareTriggerInterval;
 
 	bool keepRunning = true;
 
 	while (keepRunning)
 	{
-		// Wait until the exact absolute time of the next hardware frame interrupt
 		std::this_thread::sleep_until(next_trigger_time);
-
-		// Advance the strict clock mathematically, avoiding any relative drift
 		next_trigger_time += hardwareTriggerInterval;
 
-		// HW INTERRUPT ARRIVED! Lock the IPC memory to communicate with AI
 		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 
 		if (dwWaitResult == WAIT_OBJECT_0)
 		{
-			// SAFE QUIT CHECK: Evaluated securely inside the locked mutex
 			if (cpListMMF->points[i].status == PointState::QUIT) {
 				keepRunning = false;
 			}
 			else
 			{
-				// FRAME DROPPING LOGIC
 				if (cpListMMF->points[i].results.state == InferenceState::PENDING) {
-					// The AI is still holding PENDING state. It hasn't finished the previous frame.
-					// In a real environment, we MUST drop this incoming camera frame to avoid memory corruption.
-					std::cerr << "### WARNING: FRAME DROP DETECTED ON CP " << i
-						<< "! AI execution exceeded 10ms.\n";
+					std::cerr << "### WARNING: FRAME DROP DETECTED ON CP " << i << "! AI execution exceeded timeframe.\n";
 				}
 				else
 				{
-					// READ RESULTS OF THE PREVIOUS FRAME (If available)
+					// READ RESULTS OF THE PREVIOUS FRAME
 					if (cpListMMF->points[i].results.state == InferenceState::RESULT_READY) {
 
 						std::wstring jsonW(cpListMMF->points[i].results.json);
-						float anomalyScore = -1.0f;
-						std::wstring status = L"UNKNOWN";
 
-						// Parse anomaly score
-						std::wstring scoreKey = L"\"anomaly_score\":";
-						size_t scorePos = jsonW.find(scoreKey);
-						if (scorePos != std::wstring::npos) {
-							try {
-								anomalyScore = std::stof(jsonW.substr(scorePos + scoreKey.length()));
+						if (cpListMMF->points[i].inferenceType == InferenceType::CLASSIFICATION) {
+							float confidence = -1.0f;
+							int class_id = -1;
+
+							std::wstring confKey = L"\"confidence\":";
+							size_t confPos = jsonW.find(confKey);
+							if (confPos != std::wstring::npos) {
+								try { confidence = std::stof(jsonW.substr(confPos + confKey.length())); }
+								catch (...) {}
 							}
-							catch (const std::invalid_argument& e) {
-								std::wcerr << L"### ERROR CP " << i << L": " << e.what() <<  std::endl;
+
+							std::wstring classKey = L"\"class_id\":";
+							size_t classPos = jsonW.find(classKey);
+							if (classPos != std::wstring::npos) {
+								try { class_id = std::stoi(jsonW.substr(classPos + classKey.length())); }
+								catch (...) {}
 							}
-							catch (const std::out_of_range& e) {
-								std::wcerr << L"### ERROR CP " << i << L": " << e.what() << std::endl;
-							}
+
+							// Print the result alongside the exact filename that generated it
+							std::cout << ">> CP " << i << " | FILE: " << lastSentFilename
+								<< " | PRED_CLASS: " << class_id << " | CONFIDENCE: " << confidence << "\n";
 						}
-
-						// Parse status
-						std::wstring statusKey = L"\"status\": \"";
-						size_t statusPos = jsonW.find(statusKey);
-						if (statusPos != std::wstring::npos) {
-							size_t valStart = statusPos + statusKey.length();
-							size_t valEnd = jsonW.find(L"\"", valStart);
-							if (valEnd != std::wstring::npos) {
-								status = jsonW.substr(valStart, valEnd - valStart);
-							}
-						}
-
-						std::wcout << L">> POINT " << i << L" AI RESULT -> Score: "
-							<< anomalyScore << L" | Status: " << status << L"\n";
 					}
 					else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
-						std::wcerr << L"### POINT " << i << L" AI ERROR DETECTED!\n";
+						std::cerr << "### POINT " << i << " AI ERROR DETECTED!\n";
 					}
 
-					// WRITE THE NEW FRAME INTO SHARED MEMORY
+					// --- WRITE THE NEW FRAME INTO SHARED MEMORY ---
 					if (pImage != NULL) {
-						uint8_t* pPixels = static_cast<uint8_t*>(pImage);
-						for (int p = 0; p < nPayload; p++) {
-							pPixels[p] = static_cast<uint8_t>(p % 2);
+						if (!imagePaths.empty()) {
+							std::string currentImagePath = imagePaths[imageIndex];
+
+							// Extract filename for the next iteration's logging
+							lastSentFilename = std::filesystem::path(currentImagePath).filename().string();
+
+							// Read and decode the image via OpenCV
+							cv::Mat img = cv::imread(currentImagePath, cv::IMREAD_COLOR);
+							if (!img.empty()) {
+								cv::Mat resizedImg;
+								// Force resize to match the Shared Memory allocated layout
+								cv::resize(img, resizedImg, cv::Size(cpListMMF->points[i].sizeX, cpListMMF->points[i].sizeY));
+
+								// Memcopy the contiguous raw BGR bytes into the MMF
+								if (resizedImg.isContinuous()) {
+									memcpy(pImage, resizedImg.data, nPayload);
+								}
+							}
+							else {
+								std::cerr << "### ERROR: Failed to decode " << lastSentFilename << "\n";
+							}
+
+							// Advance the index and loop back if we hit the end of the folder
+							imageIndex = (imageIndex + 1) % imagePaths.size();
+						}
+						else {
+							// Fallback mechanism if the folder is empty or invalid
+							uint8_t* pPixels = static_cast<uint8_t*>(pImage);
+							for (int p = 0; p < nPayload; p++) {
+								pPixels[p] = static_cast<uint8_t>(p % 2);
+							}
 						}
 					}
 
@@ -199,11 +237,7 @@ void controlPointThreadFunc(int i)
 					SetEvent(hControlPointEvent[i]);
 				}
 			}
-
-			// Always safely release the mutex so the AI can lock it
-			if (!ReleaseMutex(hControlPointMutex[i])) {
-				std::cerr << "### Thread " << i << " release mutex error\n";
-			}
+			ReleaseMutex(hControlPointMutex[i]);
 		}
 	}
 
@@ -263,6 +297,12 @@ void Quit() {
 
 void Start()
 {
+	static bool isStarted = false;
+	if (isStarted) {
+		std::cout << "### WARNING: Simulation already running!\n";
+		return;
+	}
+	isStarted = true;
 	for (int i = 0; i < NUM_CONTROL_POINTS; i++)
 	{
 		threads[i] = std::thread(controlPointThreadFunc, i);
@@ -336,7 +376,7 @@ bool Configure()
 			cpListMMF->points[i].bpp = 24;
 
 			// Specific path for your EfficientAD model
-			wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:/emanuele/Code/anomaly_detection_for_textile_industry/exports/efficientad_onnx/weights/onnx/26062026_083600_dustOnValidationAndTrain_EfficientAd_wide_resnet50_2.onnx"));
+			wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:\\emanuele\\Code\\test_classifier\\export\\yolo_pure.onnx"));
 
 			swprintf_s(cpListMMF->points[i].mutexName, 128, TEXT("CP_%lu_MUTEX"), cpListMMF->points[i].idPunto);
 			swprintf_s(cpListMMF->points[i].eventReadyName, 128, TEXT("CP_%lu_EVENTREADY"), cpListMMF->points[i].idPunto);
@@ -346,7 +386,7 @@ bool Configure()
 			createEvent(hControlPointEvent[i], i, L"EVENTREADY");
 			createEvent(hControlPointResults[i], i, L"EVENTRESULTS");
 
-			cpListMMF->points[i].inferenceType = InferenceType::ANOMALY;
+			cpListMMF->points[i].inferenceType = InferenceType::CLASSIFICATION;
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
