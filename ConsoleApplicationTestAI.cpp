@@ -105,7 +105,9 @@ void controlPointThreadFunc(int i)
 	}
 
 	// Map OUTPUT RESIMAGE (AI -> Sender)
-	int nResPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY;
+	// Must match the size the worker allocates (sizeX * sizeY * bpp/8):
+	// the heatmap is written back as RGB, not grayscale
+	int nResPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY * cpListMMF->points[i].bpp / 8;
 	std::wstring resName = L"MMF_" + std::to_wstring(cpListMMF->points[i].idPunto) + L"_RESIMAGE";
 	HANDLE hMMFResImage = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, nResPayload, resName.c_str());
 	void* pResImage = NULL;
@@ -168,7 +170,33 @@ void controlPointThreadFunc(int i)
 
 						std::wstring jsonW(cpListMMF->points[i].results.json);
 
-						if (cpListMMF->points[i].inferenceType == InferenceType::CLASSIFICATION) {
+						if (cpListMMF->points[i].inferenceType == InferenceType::ANOMALY) {
+							float anomalyScore = -1.0f;
+							std::wstring status = L"UNKNOWN";
+
+							// nlohmann/json emits compact JSON: {"anomaly_score":0.123,"status":"OK"}
+							std::wstring scoreKey = L"\"anomaly_score\":";
+							size_t scorePos = jsonW.find(scoreKey);
+							if (scorePos != std::wstring::npos) {
+								try { anomalyScore = std::stof(jsonW.substr(scorePos + scoreKey.length())); }
+								catch (...) {}
+							}
+
+							std::wstring statusKey = L"\"status\":\"";
+							size_t statusPos = jsonW.find(statusKey);
+							if (statusPos != std::wstring::npos) {
+								size_t valStart = statusPos + statusKey.length();
+								size_t valEnd = jsonW.find(L"\"", valStart);
+								if (valEnd != std::wstring::npos) {
+									status = jsonW.substr(valStart, valEnd - valStart);
+								}
+							}
+
+							std::wcout << L">> CP " << i << L" | FILE: "
+								<< std::filesystem::path(lastSentFilename).wstring()
+								<< L" | ANOMALY_SCORE: " << anomalyScore << L" | STATUS: " << status << L"\n";
+						}
+						else if (cpListMMF->points[i].inferenceType == InferenceType::CLASSIFICATION) {
 							float confidence = -1.0f;
 							int class_id = -1;
 
@@ -375,8 +403,16 @@ bool Configure()
 			cpListMMF->points[i].sizeY = 512;
 			cpListMMF->points[i].bpp = 24;
 
-			// Specific path for your EfficientAD model
-			wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:\\emanuele\\Code\\test_classifier\\export\\yolo_pure.onnx"));
+			// IMPORTANT: pathModello and inferenceType MUST stay in sync.
+			// Pick ONE pair and keep the other commented out.
+
+			// --- ANOMALY (EfficientAD) ---
+			wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:/emanuele/Code/anomaly_detection_for_textile_industry/exports/efficientad_onnx/weights/onnx/26062026_083600_dustOnValidationAndTrain_EfficientAd_wide_resnet50_2.onnx"));
+			cpListMMF->points[i].inferenceType = InferenceType::ANOMALY;
+
+			// --- CLASSIFICATION (YOLO) ---
+			//wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:\\emanuele\\Code\\test_classifier\\export\\yolo_pure.onnx"));
+			//cpListMMF->points[i].inferenceType = InferenceType::CLASSIFICATION;
 
 			swprintf_s(cpListMMF->points[i].mutexName, 128, TEXT("CP_%lu_MUTEX"), cpListMMF->points[i].idPunto);
 			swprintf_s(cpListMMF->points[i].eventReadyName, 128, TEXT("CP_%lu_EVENTREADY"), cpListMMF->points[i].idPunto);
@@ -386,7 +422,6 @@ bool Configure()
 			createEvent(hControlPointEvent[i], i, L"EVENTREADY");
 			createEvent(hControlPointResults[i], i, L"EVENTRESULTS");
 
-			cpListMMF->points[i].inferenceType = InferenceType::CLASSIFICATION;
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
