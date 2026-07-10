@@ -153,7 +153,7 @@ void controlPointThreadFunc(int i)
 
 		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 
-		if (dwWaitResult == WAIT_OBJECT_0)
+		if (dwWaitResult == WAIT_OBJECT_0 || dwWaitResult == WAIT_ABANDONED)
 		{
 			if (cpListMMF->points[i].status == PointState::QUIT) {
 				keepRunning = false;
@@ -280,13 +280,15 @@ void controlPointThreadFunc(int i)
 void Quit() {
 	DWORD mutexWait = WaitForSingleObject(hListMutex, INFINITE);
 	switch (mutexWait) {
+	// Abandoned mutex still grants ownership: handle it like a normal acquisition
+	case WAIT_ABANDONED:
 	case WAIT_OBJECT_0:
 	{
 		__try {
 			cpListMMF->state = ListState::QUIT;
 			for (int i = 0; i < NUM_CONTROL_POINTS; i++) {
 				DWORD innerMutexWait = WaitForSingleObject(hControlPointMutex[i], INFINITE);
-				if (innerMutexWait == WAIT_OBJECT_0) {
+				if (innerMutexWait == WAIT_OBJECT_0 || innerMutexWait == WAIT_ABANDONED) {
 					cpListMMF->points[i].status = PointState::QUIT;
 				}
 				ReleaseMutex(hControlPointMutex[i]);
@@ -314,10 +316,6 @@ void Quit() {
 	case WAIT_TIMEOUT:
 	{
 		std::cout << "Main thread waiting for the global mutex!" << std::endl;
-		break;
-	}
-	case WAIT_ABANDONED:
-	{
 		break;
 	}
 	}
@@ -388,6 +386,10 @@ bool Configure()
 
 	switch (globalWaitResult)
 	{
+	// WAIT_ABANDONED still grants ownership (previous owner crashed while holding
+	// the mutex). It must be handled like WAIT_OBJECT_0 and released normally,
+	// otherwise the mutex leaks and both processes end up deadlocked.
+	case WAIT_ABANDONED:
 	case WAIT_OBJECT_0:
 	{
 		cpListMMF->state = ListState::UPDATE_PENDING;
@@ -486,10 +488,6 @@ bool Configure()
 		std::cout << "Main thread waiting for the global mutex!" << std::endl;
 		break;
 	}
-	case WAIT_ABANDONED:
-	{
-		break;
-	}
 	}
 	return isConfigured;
 }
@@ -570,7 +568,10 @@ int main()
 		}
 		DWORD resWait = WaitForSingleObject(hListMutex, 100);
 		switch (resWait) {
-			case WAIT_OBJECT_0: 
+			// Abandoned mutex still grants ownership: without releasing it here
+			// this process would keep LISTMUTEX forever, deadlocking the manager
+			case WAIT_ABANDONED:
+			case WAIT_OBJECT_0:
 			{
 				__try {
 					if (cpListMMF->state == ListState::QUIT) {
@@ -586,11 +587,6 @@ int main()
 			{
 				break;
 			}
-			case WAIT_ABANDONED:
-			{
-				break;
-			}
-				
 		}
 	}
 
