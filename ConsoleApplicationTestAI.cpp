@@ -3,6 +3,7 @@
 
 #include "Windows.h"
 #include "conio.h"
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -13,6 +14,8 @@
 #include <vector>
 #include <algorithm>
 #include <cwctype>
+#include <fmt/core.h>
+#include <fmt/color.h>
 
 #define NUM_CONTROL_POINTS 3
 
@@ -100,6 +103,16 @@ HANDLE hListEventTrigger = NULL;
 HANDLE hListEventAck = NULL;
 int frameRate_milliseconds = 100;
 
+// Per-control-point statistics, printed once the program terminates
+std::atomic<unsigned long> g_frameDropCount[NUM_CONTROL_POINTS];
+std::atomic<unsigned long> g_framesSent[NUM_CONTROL_POINTS];
+
+// Convert wide strings coming from the IPC structs / command line so all
+// logging can go through narrow fmt::print (avoids mixing stream orientations)
+static std::string ToNarrow(const std::wstring& wide) {
+	return std::filesystem::path(wide).string();
+}
+
 void controlPointThreadFunc(int i)
 {
 	// Map INPUT IMAGE (Sender -> AI)
@@ -137,15 +150,74 @@ void controlPointThreadFunc(int i)
 		}
 	}
 	catch (const std::exception& e) {
-		std::cerr << "### ERROR reading directory: " << e.what() << "\n";
+		fmt::print(stderr, "### ERROR reading directory: {}\n", e.what());
 	}
 
-	std::cout << "Thread " << i << " running (Simulating Frame Grabber). Loaded " << imagePaths.size() << " images.\n";
+	fmt::print("Thread {} running (Simulating Frame Grabber). Loaded {} images.\n", i, imagePaths.size());
 
 	int imageIndex = 0;
 	std::string lastSentFilename = "NONE";
 
-	// HARDWARE TRIGGER SIMULATION: Strict 100ms interval (10 FPS)
+	// Frame staging: decode + resize happen OUTSIDE the trigger critical path
+	// (during the idle time between two triggers), so at trigger time the only
+	// remaining cost is a memcpy into shared memory
+	cv::Mat stagedFrame;
+	std::string stagedFilename = "NONE";
+
+	auto stageNextFrame = [&]() {
+		stagedFrame.release();
+		if (imagePaths.empty()) {
+			return;
+		}
+		const std::string& currentImagePath = imagePaths[imageIndex];
+		stagedFilename = std::filesystem::path(currentImagePath).filename().string();
+
+		cv::Mat img = cv::imread(currentImagePath, cv::IMREAD_COLOR);
+		if (img.empty()) {
+			fmt::print(stderr, "### ERROR: Failed to decode {}\n", stagedFilename);
+		}
+		else {
+			// Force resize to match the Shared Memory allocated layout
+			cv::resize(img, stagedFrame, cv::Size(cpListMMF->points[i].sizeX, cpListMMF->points[i].sizeY));
+		}
+
+		// Advance the index and loop back if we hit the end of the folder
+		imageIndex = (imageIndex + 1) % static_cast<int>(imagePaths.size());
+	};
+
+	// Copies the staged frame into shared memory and triggers the AI engine.
+	// Must be called with hControlPointMutex[i] held.
+	auto sendStagedFrame = [&]() {
+		if (pImage != NULL) {
+			if (!stagedFrame.empty() && stagedFrame.isContinuous()) {
+				memcpy(pImage, stagedFrame.data, nPayload);
+				lastSentFilename = stagedFilename;
+			}
+			else if (imagePaths.empty()) {
+				// Fallback mechanism if the folder is empty or invalid
+				uint8_t* pPixels = static_cast<uint8_t*>(pImage);
+				for (int p = 0; p < nPayload; p++) {
+					pPixels[p] = static_cast<uint8_t>(p % 2);
+				}
+			}
+		}
+
+		// TRIGGER AI ENGINE FOR THE NEW FRAME
+		cpListMMF->points[i].results.state = InferenceState::PENDING;
+		g_framesSent[i]++;
+		ResetEvent(hControlPointResults[i]);
+		SetEvent(hControlPointEvent[i]);
+	};
+
+	// Stage the first frame before entering the timed loop. The trigger cadence
+	// is hardware-faithful from t0: a real camera cannot be slowed down, so no
+	// result is awaited before starting. Cold-start mitigation belongs to the
+	// AI engine warmup (done at Configure time, before the camera starts); if
+	// the first inference still exceeds the timeframe, that is a genuine drop
+	// and is reported and counted as such.
+	stageNextFrame();
+
+	// HARDWARE TRIGGER SIMULATION: strict interval from the start
 	const auto hardwareTriggerInterval = std::chrono::milliseconds(frameRate_milliseconds);
 	auto next_trigger_time = std::chrono::high_resolution_clock::now() + hardwareTriggerInterval;
 
@@ -156,6 +228,7 @@ void controlPointThreadFunc(int i)
 		std::this_thread::sleep_until(next_trigger_time);
 		next_trigger_time += hardwareTriggerInterval;
 
+		bool frameSent = false;
 		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 
 		if (dwWaitResult == WAIT_OBJECT_0 || dwWaitResult == WAIT_ABANDONED)
@@ -166,144 +239,90 @@ void controlPointThreadFunc(int i)
 			else
 			{
 				if (cpListMMF->points[i].results.state == InferenceState::PENDING) {
-					std::cerr << "### WARNING: FRAME DROP DETECTED ON CP " << i << "! AI execution exceeded timeframe.\n";
+					g_frameDropCount[i]++;
+					fmt::print(stderr, fg(fmt::color::yellow),
+						"### WARNING: FRAME DROP DETECTED ON CP {}! AI execution exceeded timeframe (drops so far: {}).\n",
+						i, g_frameDropCount[i].load());
 				}
 				else
 				{
 					// READ RESULTS OF THE PREVIOUS FRAME
 					if (cpListMMF->points[i].results.state == InferenceState::RESULT_READY) {
 
+						// The JSON payload is plain ASCII: convert it once and parse narrow
 						std::wstring jsonW(cpListMMF->points[i].results.json);
+						std::string jsonStr(jsonW.begin(), jsonW.end());
 
 						if (cpListMMF->points[i].inferenceType == InferenceType::ANOMALY) {
 							float anomalyScore = -1.0f;
-							std::wstring status = L"UNKNOWN";
+							std::string status = "UNKNOWN";
 
 							// nlohmann/json emits compact JSON: {"anomaly_score":0.123,"status":"OK"}
-							std::wstring scoreKey = L"\"anomaly_score\":";
-							size_t scorePos = jsonW.find(scoreKey);
-							if (scorePos != std::wstring::npos) {
-								try { anomalyScore = std::stof(jsonW.substr(scorePos + scoreKey.length())); }
-								catch (...) {}
-							}
-
-							std::wstring statusKey = L"\"status\":\"";
-							size_t statusPos = jsonW.find(statusKey);
-							if (statusPos != std::wstring::npos) {
-								size_t valStart = statusPos + statusKey.length();
-								size_t valEnd = jsonW.find(L"\"", valStart);
-								if (valEnd != std::wstring::npos) {
-									status = jsonW.substr(valStart, valEnd - valStart);
+							const std::string scoreKey = "\"anomaly_score\":";
+							size_t scorePos = jsonStr.find(scoreKey);
+							if (scorePos != std::string::npos) {
+								try { anomalyScore = std::stof(jsonStr.substr(scorePos + scoreKey.length())); }
+								catch (const std::exception& e) {
+									fmt::print(stderr, "Exception occurred: {}\n", e.what());
 								}
 							}
 
-							std::wcout << L">> CP " << i << L" | FILE: "
-								<< std::filesystem::path(lastSentFilename).wstring()
-								<< L" | ANOMALY_SCORE: " << anomalyScore << L" | STATUS: " << status << L"\n";
+							const std::string statusKey = "\"status\":\"";
+							size_t statusPos = jsonStr.find(statusKey);
+							if (statusPos != std::string::npos) {
+								size_t valStart = statusPos + statusKey.length();
+								size_t valEnd = jsonStr.find('"', valStart);
+								if (valEnd != std::string::npos) {
+									status = jsonStr.substr(valStart, valEnd - valStart);
+								}
+							}
+
+							fmt::print(">> CP {} | FILE: {} | ANOMALY_SCORE: {} | STATUS: {}\n",
+								i, lastSentFilename, anomalyScore, status);
 						}
 						else if (cpListMMF->points[i].inferenceType == InferenceType::CLASSIFICATION) {
 							float confidence = -1.0f;
 							int class_id = -1;
 
-							std::wstring confKey = L"\"confidence\":";
-							size_t confPos = jsonW.find(confKey);
-							if (confPos != std::wstring::npos) {
-								try { confidence = std::stof(jsonW.substr(confPos + confKey.length())); }
-								catch (std::exception& e) {
-									std::cerr << "Excpetion occurred: " << e.what() << std::endl;
+							const std::string confKey = "\"confidence\":";
+							size_t confPos = jsonStr.find(confKey);
+							if (confPos != std::string::npos) {
+								try { confidence = std::stof(jsonStr.substr(confPos + confKey.length())); }
+								catch (const std::exception& e) {
+									fmt::print(stderr, "Exception occurred: {}\n", e.what());
 								}
 							}
 
-							std::wstring classKey = L"\"class_id\":";
-							size_t classPos = jsonW.find(classKey);
-							if (classPos != std::wstring::npos) {
-								try { class_id = std::stoi(jsonW.substr(classPos + classKey.length())); }
-								catch (std::exception& e) {
-									std::cerr << "Excpetion occurred: " << e.what() << std::endl;
+							const std::string classKey = "\"class_id\":";
+							size_t classPos = jsonStr.find(classKey);
+							if (classPos != std::string::npos) {
+								try { class_id = std::stoi(jsonStr.substr(classPos + classKey.length())); }
+								catch (const std::exception& e) {
+									fmt::print(stderr, "Exception occurred: {}\n", e.what());
 								}
 							}
 
 							// Print the result alongside the exact filename that generated it
-							std::cout << ">> CP " << i << " | FILE: " << lastSentFilename
-								<< " | PRED_CLASS: " << class_id << " | CONFIDENCE: " << confidence << "\n";
-						}
-						else if (cpListMMF->points[i].inferenceType == InferenceType::ANOMALY) {
-							float anomaly_score = -1.0f;
-							bool is_anomaly = false;
-
-							std::wstring scoreKey = L"\"anomaly_score\":";
-							size_t scorePos = jsonW.find(scoreKey);
-							if (scorePos != std::wstring::npos) {
-								try { anomaly_score = std::stof(jsonW.substr(scorePos + scoreKey.length())); }
-								catch (std::exception& e) {
-									std::cerr << "Excpetion occurred: " << e.what() << std::endl;
-								}
-							}
-
-							std::wstring isAnomalyKey = L"\"status\":";
-							size_t isAnomalyPos = jsonW.find(isAnomalyKey);
-							if (isAnomalyPos != std::wstring::npos) {
-								try {
-									std::wstring val = jsonW.substr(isAnomalyPos + isAnomalyKey.length());
-									// Check if the JSON value contains "true" or "1"
-									is_anomaly = (val.find(L"true") != std::wstring::npos || val.find(L"1") != std::wstring::npos);
-								}
-								catch (std::exception& e) {
-									std::cerr << "Excpetion occurred: " << e.what() << std::endl;
-								}
-							}
-
-							std::cout << ">> CP " << i << " | FILE: " << lastSentFilename
-								<< " | ANOMALY SCORE: " << anomaly_score << " | IS_ANOMALY: " << is_anomaly << "\n";
+							fmt::print(">> CP {} | FILE: {} | PRED_CLASS: {} | CONFIDENCE: {}\n",
+								i, lastSentFilename, class_id, confidence);
 						}
 					}
 					else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
-						std::cerr << "### POINT " << i << " AI ERROR DETECTED!\n";
+						fmt::print(stderr, "### POINT {} AI ERROR DETECTED!\n", i);
 					}
 
-					// --- WRITE THE NEW FRAME INTO SHARED MEMORY ---
-					if (pImage != NULL) {
-						if (!imagePaths.empty()) {
-							std::string currentImagePath = imagePaths[imageIndex];
-
-							// Extract filename for the next iteration's logging
-							lastSentFilename = std::filesystem::path(currentImagePath).filename().string();
-
-							// Read and decode the image via OpenCV
-							cv::Mat img = cv::imread(currentImagePath, cv::IMREAD_COLOR);
-							if (!img.empty()) {
-								cv::Mat resizedImg;
-								// Force resize to match the Shared Memory allocated layout
-								cv::resize(img, resizedImg, cv::Size(cpListMMF->points[i].sizeX, cpListMMF->points[i].sizeY));
-
-								// Memcopy the contiguous raw BGR bytes into the MMF
-								if (resizedImg.isContinuous()) {
-									memcpy(pImage, resizedImg.data, nPayload);
-								}
-							}
-							else {
-								std::cerr << "### ERROR: Failed to decode " << lastSentFilename << "\n";
-							}
-
-							// Advance the index and loop back if we hit the end of the folder
-							imageIndex = (imageIndex + 1) % imagePaths.size();
-						}
-						else {
-							// Fallback mechanism if the folder is empty or invalid
-							uint8_t* pPixels = static_cast<uint8_t*>(pImage);
-							for (int p = 0; p < nPayload; p++) {
-								pPixels[p] = static_cast<uint8_t>(p % 2);
-							}
-						}
-					}
-
-					// TRIGGER AI ENGINE FOR THE NEW FRAME
-					cpListMMF->points[i].results.state = InferenceState::PENDING;
-					ResetEvent(hControlPointResults[i]);
-					SetEvent(hControlPointEvent[i]);
+					// --- WRITE THE (PRE-DECODED) FRAME INTO SHARED MEMORY AND TRIGGER ---
+					sendStagedFrame();
+					frameSent = true;
 				}
 			}
 			ReleaseMutex(hControlPointMutex[i]);
+		}
+
+		// Prepare the next frame during the idle time until the next trigger.
+		// On a dropped tick the staged frame is kept for the next attempt.
+		if (keepRunning && frameSent) {
+			stageNextFrame();
 		}
 	}
 
@@ -312,7 +331,8 @@ void controlPointThreadFunc(int i)
 	if (pResImage) UnmapViewOfFile(pResImage);
 	if (hMMFResImage) CloseHandle(hMMFResImage);
 
-	std::cout << "Thread " << i << " stopped!\n";
+	fmt::print("Thread {} stopped! (frames sent: {}, frame drops: {})\n",
+		i, g_framesSent[i].load(), g_frameDropCount[i].load());
 }
 
 void Quit() {
@@ -342,16 +362,16 @@ void Quit() {
 
 		DWORD ackWait = WaitForSingleObject(hListEventAck, 3000);
 		if (ackWait == WAIT_OBJECT_0) {
-			std::cout << "ONNX manager shutdown acknowledged." << std::endl;
+			fmt::print("ONNX manager shutdown acknowledged.\n");
 		}
 		else {
-			std::cout << "### ONNX manager shutdown timeout!" << std::endl;
+			fmt::print("### ONNX manager shutdown timeout!\n");
 		}
 		break;
 	}
 	case WAIT_TIMEOUT:
 	{
-		std::cout << "Main thread waiting for the global mutex!" << std::endl;
+		fmt::print("Main thread waiting for the global mutex!\n");
 		break;
 	}
 	}
@@ -361,7 +381,7 @@ void Start()
 {
 	static bool isStarted = false;
 	if (isStarted) {
-		std::cout << "### WARNING: Simulation already running!\n";
+		fmt::print("### WARNING: Simulation already running!\n");
 		return;
 	}
 	isStarted = true;
@@ -384,10 +404,11 @@ void createMutex(HANDLE& hMutex, int i) {
 	hMutex = CreateMutex(NULL, FALSE, name);
 
 	if (hMutex == NULL) {
-		std::wcout << TEXT("CreateMutex error: ") << GetLastError() << std::endl;
+		fmt::print(stderr, "CreateMutex error: {}\n", GetLastError());
 	}
 	else {
-		std::wcout << TEXT("CreateMutex ") << ((GetLastError() == ERROR_ALREADY_EXISTS) ? TEXT("opened existing") : TEXT("created new")) << TEXT(": ") << name << std::endl;
+		fmt::print("CreateMutex {}: {}\n",
+			(GetLastError() == ERROR_ALREADY_EXISTS) ? "opened existing" : "created new", ToNarrow(name));
 	}
 }
 
@@ -408,10 +429,11 @@ void createEvent(HANDLE& hEvent, int i, const std::wstring& suffix) {
 	hEvent = CreateEvent(NULL, FALSE, FALSE, name);
 
 	if (hEvent == NULL) {
-		std::wcout << TEXT("CreateEvent error: ") << GetLastError() << std::endl;
+		fmt::print(stderr, "CreateEvent error: {}\n", GetLastError());
 	}
 	else {
-		std::wcout << TEXT("CreateEvent ") << ((GetLastError() == ERROR_ALREADY_EXISTS) ? TEXT("opened existing") : TEXT("created new")) << TEXT(": ") << name << std::endl;
+		fmt::print("CreateEvent {}: {}\n",
+			(GetLastError() == ERROR_ALREADY_EXISTS) ? "opened existing" : "created new", ToNarrow(name));
 	}
 }
 
@@ -455,17 +477,17 @@ bool Configure()
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
-		std::cout << "Release the global mutex " << std::endl;
+		fmt::print("Release the global mutex\n");
 		if (!ReleaseMutex(hListMutex))
 		{
-			std::cout << "### Release global mutex error" << std::endl;
+			fmt::print(stderr, "### Release global mutex error\n");
 		}
 
 		// Notify the AI to start configuration (and TensorRT warmup)
 		SetEvent(hListEventTrigger);
 
-		std::wcout << L">> Waiting for AI engine configuration..." << std::endl;
-		std::wcout << L">> [NOTE: First-time TensorRT optimization takes time. Press 'q' to abort]" << std::endl;
+		fmt::print(">> Waiting for AI engine configuration...\n");
+		fmt::print(">> [NOTE: First-time TensorRT optimization takes time. Press 'q' to abort]\n");
 
 		bool ackReceived = false;
 		bool abortRequested = false;
@@ -493,7 +515,7 @@ bool Configure()
 
 		// If 'q' was pressed, interrupt cleanly and immediately
 		if (abortRequested) {
-			std::wcout << L"### WARNING: Configuration interrupted by user. Initiating shutdown..." << std::endl;
+			fmt::print("### WARNING: Configuration interrupted by user. Initiating shutdown...\n");
 			Quit();
 			return false;
 		}
@@ -501,11 +523,11 @@ bool Configure()
 		// Update the global state
 		WaitForSingleObject(hListMutex, INFINITE);
 		if (cpListMMF->state == ListState::CONFIGURED) {
-			std::cout << "Configuration control points completed!" << std::endl;
+			fmt::print("Configuration control points completed!\n");
 			isConfigured = true;
 		}
 		else {
-			std::cout << "### ERROR: control points configuration failed." << std::endl;
+			fmt::print(stderr, "### ERROR: control points configuration failed.\n");
 		}
 		ReleaseMutex(hListMutex);
 
@@ -513,7 +535,7 @@ bool Configure()
 	}
 	case WAIT_TIMEOUT:
 	{
-		std::cout << "Main thread waiting for the global mutex!" << std::endl;
+		fmt::print("Main thread waiting for the global mutex!\n");
 		break;
 	}
 	}
@@ -559,7 +581,7 @@ bool parseInferenceType(std::wstring value, InferenceType& outType)
 
 int wmain(int argc, wchar_t* argv[])
 {
-	std::wcout << TEXT("DELTA VISIONE - Test AI via MMF + ONNX!\n");
+	fmt::print("DELTA VISIONE - Test AI via MMF + ONNX!\n");
 
 	// Optional positional arguments; defaults defined at the top of the file
 	// Usage: ConsoleApplicationTestAI.exe [inputFolder] [modelPath] [anomaly|classification|object_detection]
@@ -569,14 +591,14 @@ int wmain(int argc, wchar_t* argv[])
 	if (argc > 2) {
 		g_modelPath = argv[2];
 		if (g_modelPath.length() >= 512) {
-			std::wcerr << L"### ERROR: model path exceeds 511 characters." << std::endl;
+			fmt::print(stderr, "### ERROR: model path exceeds 511 characters.\n");
 			return 1;
 		}
 	}
 	if (argc > 3) {
 		if (!parseInferenceType(argv[3], g_inferenceType)) {
-			std::wcerr << L"### ERROR: unknown analysis type '" << argv[3]
-				<< L"'. Valid values: anomaly (0), classification (1), object_detection (2)." << std::endl;
+			fmt::print(stderr, "### ERROR: unknown analysis type '{}'. Valid values: anomaly (0), classification (1), object_detection (2).\n",
+				ToNarrow(argv[3]));
 			return 1;
 		}
 	}
@@ -585,27 +607,28 @@ int wmain(int argc, wchar_t* argv[])
 		try {
 			frameRate_milliseconds = std::stoi(argv[4]);
 		}
-		catch (const std::exception& e) {
-			std::wcerr << L"### ERROR: invalid frame rate value: '" << argv[4]
-				<< L"'. Must be an integer." << std::endl;
+		catch (const std::exception&) {
+			fmt::print(stderr, "### ERROR: invalid frame rate value: '{}'. Must be an integer.\n", ToNarrow(argv[4]));
 			return 1;
 		}
 	}
 
 	if (!std::filesystem::is_directory(g_inputFolder)) {
-		std::wcerr << L"### WARNING: input folder does not exist or is not a directory: "
-			<< g_inputFolder.wstring() << std::endl;
+		fmt::print(stderr, "### WARNING: input folder does not exist or is not a directory: {}\n", g_inputFolder.string());
 	}
 	if (!std::filesystem::is_regular_file(g_modelPath)) {
-		std::wcerr << L"### WARNING: model file not found: " << g_modelPath << std::endl;
+		fmt::print(stderr, "### WARNING: model file not found: {}\n", ToNarrow(g_modelPath));
 	}
 
-	std::wcout << L">> Input folder : " << g_inputFolder.wstring() << L"\n"
-		<< L">> Model path   : " << g_modelPath << L"\n"
-		<< L">> Analysis type: "
-		<< (g_inferenceType == InferenceType::ANOMALY ? L"ANOMALY" :
-			g_inferenceType == InferenceType::CLASSIFICATION ? L"CLASSIFICATION" : L"OBJECT_DETECTION")
-		<< L"\n" << std::endl;
+	fmt::print(">> Input folder : {}\n"
+		">> Model path   : {}\n"
+		">> Analysis type: {}\n"
+		">> Trigger rate : {} ms\n\n",
+		g_inputFolder.string(),
+		ToNarrow(g_modelPath),
+		g_inferenceType == InferenceType::ANOMALY ? "ANOMALY" :
+		g_inferenceType == InferenceType::CLASSIFICATION ? "CLASSIFICATION" : "OBJECT_DETECTION",
+		frameRate_milliseconds);
 
 	srand(1792);
 
@@ -630,12 +653,12 @@ int wmain(int argc, wchar_t* argv[])
 		wcscpy_s(cpListMMF->listEventAckName, 128, TEXT("LISTEVENTACK"));
 	}
 	else {
-		std::cout << "Could not map view of file (" << GetLastError() << ")." << std::endl;
+		fmt::print(stderr, "Could not map view of file ({}).\n", GetLastError());
 		CloseHandle(hcpListMMF);
 		return 1;
 	}
 
-	std::cout << "Press 'q' to quit, press 'c' to configure, press 's' to start sim" << std::endl;
+	fmt::print("Press 'q' to quit, press 'c' to configure, press 's' to start sim\n");
 
 	bool isRunning = true;
 	bool isConfigured = false;
@@ -653,7 +676,7 @@ int wmain(int argc, wchar_t* argv[])
 					isConfigured = Configure();
 				}
 				if (!isConfigured) {
-					std::cout << "### ERROR: Configuration failed...starting shutdown!" << std::endl;
+					fmt::print(stderr, "### ERROR: Configuration failed...starting shutdown!\n");
 					Quit();
 				}
 				break;
@@ -664,13 +687,13 @@ int wmain(int argc, wchar_t* argv[])
 					Start();
 				}
 				else {
-					std::cout << "### ERROR: Configure before starting!" << std::endl;
+					fmt::print(stderr, "### ERROR: Configure before starting!\n");
 				}
 				break;
 			}
 
 			case 'q':
-				std::cout << "Initiating shutdown sequence..." << std::endl;
+				fmt::print("Initiating shutdown sequence...\n");
 				Quit();
 				break;
 
@@ -708,6 +731,21 @@ int wmain(int argc, wchar_t* argv[])
 	CloseHandle(hListMutex);
 	CloseHandle(hListEventTrigger);
 	CloseHandle(hListEventAck);
+
+	// --- FINAL RUN SUMMARY ---
+	unsigned long totalDrops = 0;
+	unsigned long totalSent = 0;
+	fmt::print("\n============ RUN SUMMARY ============\n");
+	for (int i = 0; i < NUM_CONTROL_POINTS; i++) {
+		const unsigned long drops = g_frameDropCount[i].load();
+		const unsigned long sent = g_framesSent[i].load();
+		totalDrops += drops;
+		totalSent += sent;
+		fmt::print("CP {} | frames sent: {:6} | frame drops: {}\n", i, sent, drops);
+	}
+	fmt::print(totalDrops > 0 ? fg(fmt::color::red) : fg(fmt::color::green),
+		"TOTAL FRAME DROPS: {} (out of {} frames sent)\n", totalDrops, totalSent);
+	fmt::print("=====================================\n");
 }
 
 // Per eseguire il programma: CTRL+F5 oppure Debug > Avvia senza eseguire debug
