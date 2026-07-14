@@ -98,6 +98,7 @@ HANDLE hControlPointResults[NUM_CONTROL_POINTS];
 HANDLE hListMutex = NULL;
 HANDLE hListEventTrigger = NULL;
 HANDLE hListEventAck = NULL;
+int frameRate_milliseconds = 100;
 
 void controlPointThreadFunc(int i)
 {
@@ -145,7 +146,7 @@ void controlPointThreadFunc(int i)
 	std::string lastSentFilename = "NONE";
 
 	// HARDWARE TRIGGER SIMULATION: Strict 100ms interval (10 FPS)
-	const auto hardwareTriggerInterval = std::chrono::milliseconds(500);
+	const auto hardwareTriggerInterval = std::chrono::milliseconds(frameRate_milliseconds);
 	auto next_trigger_time = std::chrono::high_resolution_clock::now() + hardwareTriggerInterval;
 
 	bool keepRunning = true;
@@ -576,6 +577,17 @@ int wmain(int argc, wchar_t* argv[])
 		if (!parseInferenceType(argv[3], g_inferenceType)) {
 			std::wcerr << L"### ERROR: unknown analysis type '" << argv[3]
 				<< L"'. Valid values: anomaly (0), classification (1), object_detection (2)." << std::endl;
+			return 1;
+		}
+	}
+
+	if (argc > 4) {
+		try {
+			frameRate_milliseconds = std::stoi(argv[4]);
+		}
+		catch (const std::exception& e) {
+			std::wcerr << L"### ERROR: invalid frame rate value: '" << argv[4]
+				<< L"'. Must be an integer." << std::endl;
 			return 1;
 		}
 	}
