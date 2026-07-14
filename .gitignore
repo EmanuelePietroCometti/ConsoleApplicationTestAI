@@ -365,4 +365,5 @@ dataset/
 .vscode/
 SDK/
 
-LocalConfig.props
+LocalConfig_*.props
+model/

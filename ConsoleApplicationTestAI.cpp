@@ -115,8 +115,7 @@ void controlPointThreadFunc(int i)
 		pResImage = MapViewOfFile(hMMFResImage, FILE_MAP_READ, 0, 0, nResPayload);
 	}
 
-	// --- NEW: Load image paths from the input folder ---
-	// Update this path to point to your actual test dataset folder
+	// Load image paths from the input folder
 	std::string inputFolder = "D:\\emanuele\\Code\\ConsoleApplicationTestAI\\dataset";
 	std::vector<std::string> imagePaths;
 
@@ -141,7 +140,7 @@ void controlPointThreadFunc(int i)
 	std::string lastSentFilename = "NONE";
 
 	// HARDWARE TRIGGER SIMULATION: Strict 100ms interval (10 FPS)
-	const auto hardwareTriggerInterval = std::chrono::milliseconds(100);
+	const auto hardwareTriggerInterval = std::chrono::milliseconds(500);
 	auto next_trigger_time = std::chrono::high_resolution_clock::now() + hardwareTriggerInterval;
 
 	bool keepRunning = true;
@@ -204,19 +203,52 @@ void controlPointThreadFunc(int i)
 							size_t confPos = jsonW.find(confKey);
 							if (confPos != std::wstring::npos) {
 								try { confidence = std::stof(jsonW.substr(confPos + confKey.length())); }
-								catch (...) {}
+								catch (std::exception& e) {
+									std::cerr << "Excpetion occurred: " << e.what() << std::endl;
+								}
 							}
 
 							std::wstring classKey = L"\"class_id\":";
 							size_t classPos = jsonW.find(classKey);
 							if (classPos != std::wstring::npos) {
 								try { class_id = std::stoi(jsonW.substr(classPos + classKey.length())); }
-								catch (...) {}
+								catch (std::exception& e) {
+									std::cerr << "Excpetion occurred: " << e.what() << std::endl;
+								}
 							}
 
 							// Print the result alongside the exact filename that generated it
 							std::cout << ">> CP " << i << " | FILE: " << lastSentFilename
 								<< " | PRED_CLASS: " << class_id << " | CONFIDENCE: " << confidence << "\n";
+						}
+						else if (cpListMMF->points[i].inferenceType == InferenceType::ANOMALY) {
+							float anomaly_score = -1.0f;
+							bool is_anomaly = false;
+
+							std::wstring scoreKey = L"\"anomaly_score\":";
+							size_t scorePos = jsonW.find(scoreKey);
+							if (scorePos != std::wstring::npos) {
+								try { anomaly_score = std::stof(jsonW.substr(scorePos + scoreKey.length())); }
+								catch (std::exception& e) {
+									std::cerr << "Excpetion occurred: " << e.what() << std::endl;
+								}
+							}
+
+							std::wstring isAnomalyKey = L"\"status\":";
+							size_t isAnomalyPos = jsonW.find(isAnomalyKey);
+							if (isAnomalyPos != std::wstring::npos) {
+								try {
+									std::wstring val = jsonW.substr(isAnomalyPos + isAnomalyKey.length());
+									// Check if the JSON value contains "true" or "1"
+									is_anomaly = (val.find(L"true") != std::wstring::npos || val.find(L"1") != std::wstring::npos);
+								}
+								catch (std::exception& e) {
+									std::cerr << "Excpetion occurred: " << e.what() << std::endl;
+								}
+							}
+
+							std::cout << ">> CP " << i << " | FILE: " << lastSentFilename
+								<< " | ANOMALY SCORE: " << anomaly_score << " | IS_ANOMALY: " << is_anomaly << "\n";
 						}
 					}
 					else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
@@ -280,15 +312,13 @@ void controlPointThreadFunc(int i)
 void Quit() {
 	DWORD mutexWait = WaitForSingleObject(hListMutex, INFINITE);
 	switch (mutexWait) {
-	// Abandoned mutex still grants ownership: handle it like a normal acquisition
-	case WAIT_ABANDONED:
 	case WAIT_OBJECT_0:
 	{
 		__try {
 			cpListMMF->state = ListState::QUIT;
 			for (int i = 0; i < NUM_CONTROL_POINTS; i++) {
 				DWORD innerMutexWait = WaitForSingleObject(hControlPointMutex[i], INFINITE);
-				if (innerMutexWait == WAIT_OBJECT_0 || innerMutexWait == WAIT_ABANDONED) {
+				if (innerMutexWait == WAIT_OBJECT_0) {
 					cpListMMF->points[i].status = PointState::QUIT;
 				}
 				ReleaseMutex(hControlPointMutex[i]);
@@ -405,16 +435,9 @@ bool Configure()
 			cpListMMF->points[i].sizeY = 512;
 			cpListMMF->points[i].bpp = 24;
 
-			// IMPORTANT: pathModello and inferenceType MUST stay in sync.
-			// Pick ONE pair and keep the other commented out.
-
-			// --- ANOMALY (EfficientAD) ---
-			wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:/emanuele/Code/anomaly_detection_for_textile_industry/exports/efficientad_onnx/weights/onnx/26062026_083600_dustOnValidationAndTrain_EfficientAd_wide_resnet50_2.onnx"));
-			cpListMMF->points[i].inferenceType = InferenceType::ANOMALY;
-
-			// --- CLASSIFICATION (YOLO) ---
-			//wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:\\emanuele\\Code\\test_classifier\\export\\yolo_pure.onnx"));
-			//cpListMMF->points[i].inferenceType = InferenceType::CLASSIFICATION;
+			// Specific path for SK-RD4ADAD model D:\\emanuele\\Code\\ConsoleApplicationTestAI\\model\\wide_res50reda_dustValidationAndTrain6042sample_auc=0.919.onnx
+			wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:\\emanuele\\Code\\ConsoleApplicationTestAI\\model\\yolo_pure.onnx"));
+		
 
 			swprintf_s(cpListMMF->points[i].mutexName, 128, TEXT("CP_%lu_MUTEX"), cpListMMF->points[i].idPunto);
 			swprintf_s(cpListMMF->points[i].eventReadyName, 128, TEXT("CP_%lu_EVENTREADY"), cpListMMF->points[i].idPunto);
@@ -424,6 +447,7 @@ bool Configure()
 			createEvent(hControlPointEvent[i], i, L"EVENTREADY");
 			createEvent(hControlPointResults[i], i, L"EVENTRESULTS");
 
+			cpListMMF->points[i].inferenceType = InferenceType::CLASSIFICATION;
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
@@ -538,7 +562,9 @@ int main()
 			{
 			case 'c':
 			{
-				isConfigured = Configure();
+				if (!isConfigured) {
+					isConfigured = Configure();
+				}
 				if (!isConfigured) {
 					std::cout << "### ERROR: Configuration failed...starting shutdown!" << std::endl;
 					Quit();
@@ -568,10 +594,7 @@ int main()
 		}
 		DWORD resWait = WaitForSingleObject(hListMutex, 100);
 		switch (resWait) {
-			// Abandoned mutex still grants ownership: without releasing it here
-			// this process would keep LISTMUTEX forever, deadlocking the manager
-			case WAIT_ABANDONED:
-			case WAIT_OBJECT_0:
+			case WAIT_OBJECT_0: 
 			{
 				__try {
 					if (cpListMMF->state == ListState::QUIT) {
