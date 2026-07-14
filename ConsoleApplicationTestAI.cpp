@@ -421,9 +421,9 @@ bool Configure()
 
 	switch (globalWaitResult)
 	{
-	// WAIT_ABANDONED still grants ownership (previous owner crashed while holding
-	// the mutex). It must be handled like WAIT_OBJECT_0 and released normally,
-	// otherwise the mutex leaks and both processes end up deadlocked.
+		// WAIT_ABANDONED still grants ownership (previous owner crashed while holding
+		// the mutex). It must be handled like WAIT_OBJECT_0 and released normally,
+		// otherwise the mutex leaks and both processes end up deadlocked.
 	case WAIT_ABANDONED:
 	case WAIT_OBJECT_0:
 	{
@@ -517,6 +517,23 @@ bool Configure()
 	}
 	}
 	return isConfigured;
+}
+
+// Called with hListMutex already owned; releases it in every case.
+// Kept as a separate function because SEH (__try/__finally) cannot coexist
+// with C++ objects requiring unwinding in the same function (C2712)
+bool isQuitRequested()
+{
+	bool quit = false;
+	__try {
+		if (cpListMMF->state == ListState::QUIT) {
+			quit = true;
+		}
+	}
+	__finally {
+		ReleaseMutex(hListMutex);
+	}
+	return quit;
 }
 
 // Parse the analysis type argument: accepts the enum name (case-insensitive) or its numeric value
@@ -652,22 +669,17 @@ int wmain(int argc, wchar_t* argv[])
 		}
 		DWORD resWait = WaitForSingleObject(hListMutex, 100);
 		switch (resWait) {
-			case WAIT_OBJECT_0: 
-			{
-				__try {
-					if (cpListMMF->state == ListState::QUIT) {
-						isRunning = false;
-					}
-				}
-				__finally {
-					ReleaseMutex(hListMutex);
-				}
-				break;
+		case WAIT_OBJECT_0:
+		{
+			if (isQuitRequested()) {
+				isRunning = false;
 			}
-			case WAIT_TIMEOUT:
-			{
-				break;
-			}
+			break;
+		}
+		case WAIT_TIMEOUT:
+		{
+			break;
+		}
 		}
 	}
 
