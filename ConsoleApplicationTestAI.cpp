@@ -12,6 +12,7 @@
 #include <opencv2/opencv.hpp>
 #include <vector>
 #include <algorithm>
+#include <cwctype>
 
 #define NUM_CONTROL_POINTS 3
 
@@ -81,6 +82,11 @@ struct ScopedMutex {
 	}
 };
 
+// Runtime configuration (overridable via command line, see wmain)
+std::filesystem::path g_inputFolder = L"D:\\emanuele\\Code\\ConsoleApplicationTestAI\\dataset";
+std::wstring g_modelPath = L"D:\\emanuele\\Code\\ConsoleApplicationTestAI\\model\\yolo_pure.onnx";
+InferenceType g_inferenceType = InferenceType::CLASSIFICATION;
+
 HANDLE hcpListMMF = NULL;
 PTcontrolPointsList cpListMMF = NULL;
 
@@ -116,11 +122,10 @@ void controlPointThreadFunc(int i)
 	}
 
 	// Load image paths from the input folder
-	std::string inputFolder = "D:\\emanuele\\Code\\ConsoleApplicationTestAI\\dataset";
 	std::vector<std::string> imagePaths;
 
 	try {
-		for (const auto& entry : std::filesystem::recursive_directory_iterator(inputFolder)) {
+		for (const auto& entry : std::filesystem::recursive_directory_iterator(g_inputFolder)) {
 			if (entry.is_regular_file()) {
 				std::string ext = entry.path().extension().string();
 				std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -435,9 +440,7 @@ bool Configure()
 			cpListMMF->points[i].sizeY = 512;
 			cpListMMF->points[i].bpp = 24;
 
-			// Specific path for SK-RD4ADAD model D:\\emanuele\\Code\\ConsoleApplicationTestAI\\model\\wide_res50reda_dustValidationAndTrain6042sample_auc=0.919.onnx
-			wcscpy_s(cpListMMF->points[i].pathModello, 512, TEXT("D:\\emanuele\\Code\\ConsoleApplicationTestAI\\model\\yolo_pure.onnx"));
-		
+			wcscpy_s(cpListMMF->points[i].pathModello, 512, g_modelPath.c_str());
 
 			swprintf_s(cpListMMF->points[i].mutexName, 128, TEXT("CP_%lu_MUTEX"), cpListMMF->points[i].idPunto);
 			swprintf_s(cpListMMF->points[i].eventReadyName, 128, TEXT("CP_%lu_EVENTREADY"), cpListMMF->points[i].idPunto);
@@ -447,7 +450,7 @@ bool Configure()
 			createEvent(hControlPointEvent[i], i, L"EVENTREADY");
 			createEvent(hControlPointResults[i], i, L"EVENTRESULTS");
 
-			cpListMMF->points[i].inferenceType = InferenceType::CLASSIFICATION;
+			cpListMMF->points[i].inferenceType = g_inferenceType;
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
@@ -516,9 +519,64 @@ bool Configure()
 	return isConfigured;
 }
 
-int main()
+// Parse the analysis type argument: accepts the enum name (case-insensitive) or its numeric value
+bool parseInferenceType(std::wstring value, InferenceType& outType)
+{
+	std::transform(value.begin(), value.end(), value.begin(), ::towlower);
+
+	if (value == L"anomaly" || value == L"0") {
+		outType = InferenceType::ANOMALY;
+	}
+	else if (value == L"classification" || value == L"1") {
+		outType = InferenceType::CLASSIFICATION;
+	}
+	else if (value == L"object_detection" || value == L"objectdetection" || value == L"2") {
+		outType = InferenceType::OBJECT_DETECTION;
+	}
+	else {
+		return false;
+	}
+	return true;
+}
+
+int wmain(int argc, wchar_t* argv[])
 {
 	std::wcout << TEXT("DELTA VISIONE - Test AI via MMF + ONNX!\n");
+
+	// Optional positional arguments; defaults defined at the top of the file
+	// Usage: ConsoleApplicationTestAI.exe [inputFolder] [modelPath] [anomaly|classification|object_detection]
+	if (argc > 1) {
+		g_inputFolder = argv[1];
+	}
+	if (argc > 2) {
+		g_modelPath = argv[2];
+		if (g_modelPath.length() >= 512) {
+			std::wcerr << L"### ERROR: model path exceeds 511 characters." << std::endl;
+			return 1;
+		}
+	}
+	if (argc > 3) {
+		if (!parseInferenceType(argv[3], g_inferenceType)) {
+			std::wcerr << L"### ERROR: unknown analysis type '" << argv[3]
+				<< L"'. Valid values: anomaly (0), classification (1), object_detection (2)." << std::endl;
+			return 1;
+		}
+	}
+
+	if (!std::filesystem::is_directory(g_inputFolder)) {
+		std::wcerr << L"### WARNING: input folder does not exist or is not a directory: "
+			<< g_inputFolder.wstring() << std::endl;
+	}
+	if (!std::filesystem::is_regular_file(g_modelPath)) {
+		std::wcerr << L"### WARNING: model file not found: " << g_modelPath << std::endl;
+	}
+
+	std::wcout << L">> Input folder : " << g_inputFolder.wstring() << L"\n"
+		<< L">> Model path   : " << g_modelPath << L"\n"
+		<< L">> Analysis type: "
+		<< (g_inferenceType == InferenceType::ANOMALY ? L"ANOMALY" :
+			g_inferenceType == InferenceType::CLASSIFICATION ? L"CLASSIFICATION" : L"OBJECT_DETECTION")
+		<< L"\n" << std::endl;
 
 	srand(1792);
 
