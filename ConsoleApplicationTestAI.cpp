@@ -101,7 +101,7 @@ HANDLE hControlPointResults[NUM_CONTROL_POINTS];
 HANDLE hListMutex = NULL;
 HANDLE hListEventTrigger = NULL;
 HANDLE hListEventAck = NULL;
-int frameRate_milliseconds = 100;
+int frameRate_milliseconds = 60;
 
 // Per-control-point statistics, printed once the program terminates
 std::atomic<unsigned long> g_frameDropCount[NUM_CONTROL_POINTS];
@@ -251,7 +251,11 @@ void controlPointThreadFunc(int i)
 
 						// The JSON payload is plain ASCII: convert it once and parse narrow
 						std::wstring jsonW(cpListMMF->points[i].results.json);
-						std::string jsonStr(jsonW.begin(), jsonW.end());
+						const wchar_t* p = cpListMMF->points[i].results.json;
+						std::string jsonStr;
+						jsonStr.reserve(wcsnlen(p, 1024));
+						for (size_t k = 0; k < 1024 && p[k]; ++k)
+							jsonStr.push_back(static_cast<char>(p[k]));  // cast esplicito -> niente C4244
 
 						if (cpListMMF->points[i].inferenceType == InferenceType::ANOMALY) {
 							float anomalyScore = -1.0f;
