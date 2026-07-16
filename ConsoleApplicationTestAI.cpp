@@ -135,6 +135,8 @@ private:
 	};
 
 	void run() {
+		// Il logger non deve mai competere con il thread trigger per la CPU.
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 		std::unique_lock<std::mutex> lk(mtx_);
 		for (;;) {
 			cv_.wait(lk, [&] { return !queue_.empty() || !running_.load(); });
@@ -196,10 +198,16 @@ HANDLE hListMutex = NULL;
 HANDLE hListEventTrigger = NULL;
 HANDLE hListEventAck = NULL;
 int frameRate_milliseconds = 15;
+int g_triggerCore = -1;   // logical core for the trigger thread (-1 = no pinning)
 
 // Per-control-point statistics, printed once the program terminates
 std::atomic<unsigned long> g_frameDropCount[NUM_CONTROL_POINTS];
 std::atomic<unsigned long> g_framesSent[NUM_CONTROL_POINTS];
+// Tick saltati perche' il SIMULATORE si e' svegliato in ritardo di >= 1
+// intervallo intero: ritardi nostri, non dell'AI, contati a parte dai drop.
+std::atomic<unsigned long> g_missedTicks[NUM_CONTROL_POINTS];
+// Peggior ritardo di risveglio rispetto al tick teorico (telemetria).
+std::atomic<long long> g_maxWakeLateUs[NUM_CONTROL_POINTS];
 
 // Convert wide strings coming from the IPC structs / command line so all
 // logging can go through narrow fmt::print (avoids mixing stream orientations)
@@ -207,12 +215,38 @@ static std::string ToNarrow(const std::wstring& wide) {
 	return std::filesystem::path(wide).string();
 }
 
+// Attesa ibrida ad alta precisione: sleep_until fino a ~2 ms dal target
+// (economico, ma con jitter dello scheduler anche a timer 1 ms), poi
+// spin-wait per l'ultimo tratto (preciso al microsecondo). Con il thread
+// pinnato su un core libero il costo dello spin e' irrilevante.
+static void preciseWaitUntil(std::chrono::steady_clock::time_point target)
+{
+	constexpr auto kSpinWindow = std::chrono::milliseconds(2);
+	const auto sleepTarget = target - kSpinWindow;
+	if (std::chrono::steady_clock::now() < sleepTarget) {
+		std::this_thread::sleep_until(sleepTarget);
+	}
+	while (std::chrono::steady_clock::now() < target) {
+		YieldProcessor();
+	}
+}
+
 void controlPointThreadFunc(int i)
 {
-	// Con la risoluzione del timer a 1 ms il jitter residuo viene dallo
-	// scheduling: alziamo la priorita' del produttore per avvicinarci alla
-	// cadenza hardware.
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	// Il processo ONNX gira in REALTIME con thread TIME_CRITICAL in spin sui
+	// core del suo slice: il produttore deve avere priorita' massima nella
+	// propria classe e, se richiesto, essere pinnato su un core FUORI dallo
+	// slice ONNX, altrimenti viene starvato e i risvegli in ritardo si
+	// trasformano in falsi frame drop.
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+	if (g_triggerCore >= 0) {
+		if (SetThreadAffinityMask(GetCurrentThread(), 1ULL << g_triggerCore) == 0) {
+			LOGE("### WARNING: SetThreadAffinityMask({}) failed ({})\n", g_triggerCore, GetLastError());
+		}
+		else {
+			LOG("Trigger thread {} pinned to logical core {}\n", i, g_triggerCore);
+		}
+	}
 
 	// Map INPUT IMAGE (Sender -> AI)
 	int nPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY * cpListMMF->points[i].bpp / 8;
@@ -234,8 +268,13 @@ void controlPointThreadFunc(int i)
 		pResImage = MapViewOfFile(hMMFResImage, FILE_MAP_READ, 0, 0, nResPayload);
 	}
 
-	// Load image paths from the input folder
-	std::vector<std::string> imagePaths;
+	// PRELOAD: decodifica + resize di TUTTE le immagini una volta sola, PRIMA
+	// del loop temporizzato. La versione precedente collezionava solo i path e
+	// faceva imread+resize a ogni ciclo: quando il decode sforava il tempo
+	// morto tra due tick, il thread arrivava in ritardo e produceva raffiche
+	// di falsi drop. Cosi' nel loop resta solo un memcpy (~0.1 ms a frame).
+	std::vector<cv::Mat> frames;
+	std::vector<std::string> frameNames;
 
 	try {
 		for (const auto& entry : std::filesystem::recursive_directory_iterator(g_inputFolder)) {
@@ -243,7 +282,20 @@ void controlPointThreadFunc(int i)
 				std::string ext = entry.path().extension().string();
 				std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 				if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
-					imagePaths.push_back(entry.path().string());
+					std::string filename = entry.path().filename().string();
+					cv::Mat img = cv::imread(entry.path().string(), cv::IMREAD_COLOR);
+					if (img.empty()) {
+						LOGE("### ERROR: Failed to decode {}\n", filename);
+						continue;
+					}
+					// Force resize to match the Shared Memory allocated layout
+					cv::Mat resized;
+					cv::resize(img, resized, cv::Size(cpListMMF->points[i].sizeX, cpListMMF->points[i].sizeY));
+					if (!resized.isContinuous()) {
+						resized = resized.clone();
+					}
+					frames.push_back(std::move(resized));
+					frameNames.push_back(std::move(filename));
 				}
 			}
 		}
@@ -252,47 +304,22 @@ void controlPointThreadFunc(int i)
 		LOGE("### ERROR reading directory: {}\n", e.what());
 	}
 
-	LOG("Thread {} running (Simulating Frame Grabber). Loaded {} images.\n", i, imagePaths.size());
+	LOG("Thread {} running (Simulating Frame Grabber). Preloaded {} frames ({} MB in RAM).\n",
+		i, frames.size(), frames.size() * static_cast<size_t>(nPayload) / (1024 * 1024));
 
 	int imageIndex = 0;
 	std::string lastSentFilename = "NONE";
 
-	// Frame staging: decode + resize happen OUTSIDE the trigger critical path
-	// (during the idle time between two triggers), so at trigger time the only
-	// remaining cost is a memcpy into shared memory
-	cv::Mat stagedFrame;
-	std::string stagedFilename = "NONE";
-
-	auto stageNextFrame = [&]() {
-		stagedFrame.release();
-		if (imagePaths.empty()) {
-			return;
-		}
-		const std::string& currentImagePath = imagePaths[imageIndex];
-		stagedFilename = std::filesystem::path(currentImagePath).filename().string();
-
-		cv::Mat img = cv::imread(currentImagePath, cv::IMREAD_COLOR);
-		if (img.empty()) {
-			LOGE("### ERROR: Failed to decode {}\n", stagedFilename);
-		}
-		else {
-			// Force resize to match the Shared Memory allocated layout
-			cv::resize(img, stagedFrame, cv::Size(cpListMMF->points[i].sizeX, cpListMMF->points[i].sizeY));
-		}
-
-		// Advance the index and loop back if we hit the end of the folder
-		imageIndex = (imageIndex + 1) % static_cast<int>(imagePaths.size());
-		};
-
-	// Copies the staged frame into shared memory and triggers the AI engine.
-	// Must be called with hControlPointMutex[i] held.
+	// Copies the current preloaded frame into shared memory and triggers the
+	// AI engine. Must be called with hControlPointMutex[i] held.
 	auto sendStagedFrame = [&]() {
 		if (pImage != NULL) {
-			if (!stagedFrame.empty() && stagedFrame.isContinuous()) {
-				memcpy(pImage, stagedFrame.data, nPayload);
-				lastSentFilename = stagedFilename;
+			if (!frames.empty()) {
+				memcpy(pImage, frames[imageIndex].data, nPayload);
+				lastSentFilename = frameNames[imageIndex];
+				imageIndex = (imageIndex + 1) % static_cast<int>(frames.size());
 			}
-			else if (imagePaths.empty()) {
+			else {
 				// Fallback mechanism if the folder is empty or invalid
 				uint8_t* pPixels = static_cast<uint8_t*>(pImage);
 				for (int p = 0; p < nPayload; p++) {
@@ -308,14 +335,6 @@ void controlPointThreadFunc(int i)
 		SetEvent(hControlPointEvent[i]);
 		};
 
-	// Stage the first frame before entering the timed loop. The trigger cadence
-	// is hardware-faithful from t0: a real camera cannot be slowed down, so no
-	// result is awaited before starting. Cold-start mitigation belongs to the
-	// AI engine warmup (done at Configure time, before the camera starts); if
-	// the first inference still exceeds the timeframe, that is a genuine drop
-	// and is reported and counted as such.
-	stageNextFrame();
-
 	// HARDWARE TRIGGER SIMULATION: strict interval from the start.
 	// Nota: la temporizzazione affidabile a <16 ms dipende da timeBeginPeriod(1)
 	// gia' attivato in wmain; senza quello il tick di sistema (~15,6 ms)
@@ -327,17 +346,36 @@ void controlPointThreadFunc(int i)
 
 	while (keepRunning)
 	{
-		std::this_thread::sleep_until(next_trigger_time);
+		preciseWaitUntil(next_trigger_time);
+
+		// Telemetria: quanto tardi ci siamo svegliati rispetto al tick teorico.
+		const auto now = std::chrono::steady_clock::now();
+		const long long lateUs =
+			std::chrono::duration_cast<std::chrono::microseconds>(now - next_trigger_time).count();
+		if (lateUs > g_maxWakeLateUs[i].load(std::memory_order_relaxed)) {
+			g_maxWakeLateUs[i].store(lateUs, std::memory_order_relaxed);
+		}
+
 		next_trigger_time += hardwareTriggerInterval;
 
-		bool frameSent = false;
+		// Se il risveglio e' in ritardo di uno o piu' intervalli INTERI, i tick
+		// persi vengono saltati, non recuperati in raffica: una camera reale
+		// non emette mai due trigger back-to-back. Il recupero a raffica
+		// trovava l'inferenza precedente ancora PENDING e generava falsi drop
+		// imputati all'AI. I tick saltati sono ritardi del simulatore e vanno
+		// nel contatore separato g_missedTicks.
+		while (next_trigger_time <= now) {
+			next_trigger_time += hardwareTriggerInterval;
+			g_missedTicks[i]++;
+		}
+
 		bool frameDropped = false;
 
 		// Copie locali del risultato del frame precedente: il parsing e le
 		// stampe avvengono FUORI dal lock, sulla copia, non sulla memoria
 		// condivisa (che il worker puo' riscrivere subito dopo il release).
 		InferenceState prevState = InferenceState::IDLE;
-		InferenceType  prevType = cpListMMF->points[i].inferenceType;
+		InferenceType  prevType = g_inferenceType;
 		wchar_t        jsonCopy[1024] = { 0 };
 
 		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
@@ -363,7 +401,6 @@ void controlPointThreadFunc(int i)
 
 				// Scrive il frame (pre-decodificato) in shared memory e triggera.
 				sendStagedFrame();
-				frameSent = true;
 			}
 			ReleaseMutex(hControlPointMutex[i]);
 		}
@@ -440,12 +477,6 @@ void controlPointThreadFunc(int i)
 		else if (prevState == InferenceState::ERROR_DETECTED) {
 			LOGE("### POINT {} AI ERROR DETECTED!\n", i);
 		}
-
-		// Prepare the next frame during the idle time until the next trigger.
-		// On a dropped tick the staged frame is kept for the next attempt.
-		if (keepRunning && frameSent) {
-			stageNextFrame();
-		}
 	}
 
 	if (pImage) UnmapViewOfFile(pImage);
@@ -453,20 +484,23 @@ void controlPointThreadFunc(int i)
 	if (pResImage) UnmapViewOfFile(pResImage);
 	if (hMMFResImage) CloseHandle(hMMFResImage);
 
-	LOG("Thread {} stopped! (frames sent: {}, frame drops: {})\n",
-		i, g_framesSent[i].load(), g_frameDropCount[i].load());
+	LOG("Thread {} stopped! (frames sent: {}, frame drops: {}, missed ticks: {})\n",
+		i, g_framesSent[i].load(), g_frameDropCount[i].load(), g_missedTicks[i].load());
 }
 
 void Quit() {
 	DWORD mutexWait = WaitForSingleObject(hListMutex, INFINITE);
 	switch (mutexWait) {
+		// WAIT_ABANDONED grants ownership too and must release the mutex like
+		// WAIT_OBJECT_0, otherwise it leaks (see the same handling in Configure)
+	case WAIT_ABANDONED:
 	case WAIT_OBJECT_0:
 	{
 		__try {
 			cpListMMF->state = ListState::QUIT;
 			for (int i = 0; i < NUM_CONTROL_POINTS; i++) {
 				DWORD innerMutexWait = WaitForSingleObject(hControlPointMutex[i], INFINITE);
-				if (innerMutexWait == WAIT_OBJECT_0) {
+				if (innerMutexWait == WAIT_OBJECT_0 || innerMutexWait == WAIT_ABANDONED) {
 					cpListMMF->points[i].status = PointState::QUIT;
 				}
 				ReleaseMutex(hControlPointMutex[i]);
@@ -709,10 +743,21 @@ int wmain(int argc, wchar_t* argv[])
 	// e i 20 ms oscillano tra 1 e 2 tick, causando frame drop.
 	timeBeginPeriod(1);
 
+	// Il processo ONNX gira in REALTIME_PRIORITY_CLASS con thread in spin:
+	// senza alzare anche la nostra classe, il thread trigger viene starvato e
+	// ogni risveglio in ritardo diventa un falso frame drop. HIGH (non
+	// REALTIME: non serve battere l'AI, basta battere i processi normali,
+	// e due processi REALTIME in competizione peggiorano entrambi).
+	if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
+		LOGE("### WARNING: SetPriorityClass(HIGH) failed ({})\n", GetLastError());
+	}
+
 	LOG("DELTA VISIONE - Test AI via MMF + ONNX!\n");
 
 	// Optional positional arguments; defaults defined at the top of the file
-	// Usage: ConsoleApplicationTestAI.exe [inputFolder] [modelPath] [anomaly|classification|object_detection] [frameRateMs]
+	// Usage: ConsoleApplicationTestAI.exe [inputFolder] [modelPath] [anomaly|classification|object_detection] [frameRateMs] [triggerCore]
+	// triggerCore: logical core (0-based) where the trigger thread is pinned.
+	// Pick a core OUTSIDE the ONNX slice (see the ONNX startup log); -1 = no pin.
 	if (argc > 1) {
 		g_inputFolder = argv[1];
 	}
@@ -747,6 +792,24 @@ int wmain(int argc, wchar_t* argv[])
 		}
 	}
 
+	if (argc > 5) {
+		try {
+			g_triggerCore = std::stoi(argv[5]);
+			if (g_triggerCore > 63) {
+				LOGE("### ERROR: trigger core must be < 64.\n");
+				logger().stop();
+				timeEndPeriod(1);
+				return 1;
+			}
+		}
+		catch (const std::exception&) {
+			LOGE("### ERROR: invalid trigger core value: '{}'. Must be an integer (-1 = no pin).\n", ToNarrow(argv[5]));
+			logger().stop();
+			timeEndPeriod(1);
+			return 1;
+		}
+	}
+
 	if (!std::filesystem::is_directory(g_inputFolder)) {
 		LOGE("### WARNING: input folder does not exist or is not a directory: {}\n", g_inputFolder.string());
 	}
@@ -757,12 +820,14 @@ int wmain(int argc, wchar_t* argv[])
 	LOG(">> Input folder : {}\n"
 		">> Model path   : {}\n"
 		">> Analysis type: {}\n"
-		">> Trigger rate : {} ms\n\n",
+		">> Trigger rate : {} ms\n"
+		">> Trigger core : {}\n\n",
 		g_inputFolder.string(),
 		ToNarrow(g_modelPath),
 		g_inferenceType == InferenceType::ANOMALY ? "ANOMALY" :
 		g_inferenceType == InferenceType::CLASSIFICATION ? "CLASSIFICATION" : "OBJECT_DETECTION",
-		frameRate_milliseconds);
+		frameRate_milliseconds,
+		g_triggerCore >= 0 ? std::to_string(g_triggerCore) : "not pinned");
 
 	srand(1792);
 
@@ -840,6 +905,10 @@ int wmain(int argc, wchar_t* argv[])
 		}
 		DWORD resWait = WaitForSingleObject(hListMutex, 100);
 		switch (resWait) {
+			// Su WAIT_ABANDONED il thread possiede comunque il mutex: va gestito
+			// come WAIT_OBJECT_0 (isQuitRequested lo rilascia), altrimenti il
+			// mutex resta acquisito per sempre e l'altro processo si blocca.
+		case WAIT_ABANDONED:
 		case WAIT_OBJECT_0:
 		{
 			if (isQuitRequested()) {
@@ -877,7 +946,11 @@ int wmain(int argc, wchar_t* argv[])
 		const unsigned long sent = g_framesSent[i].load();
 		totalDrops += drops;
 		totalSent += sent;
-		LOG("CP {} | frames sent: {:6} | frame drops: {}\n", i, sent, drops);
+		// frame drops  = AI ancora PENDING a un tick puntuale (colpa dell'AI)
+		// missed ticks = risveglio del simulatore in ritardo >= 1 intervallo (colpa nostra)
+		LOG("CP {} | frames sent: {:6} | frame drops: {} | missed ticks (sim late): {} | max wake lateness: {:.2f} ms\n",
+			i, sent, drops, g_missedTicks[i].load(),
+			g_maxWakeLateUs[i].load() / 1000.0);
 	}
 	LOGC(totalDrops > 0 ? fmt::color::red : fmt::color::green, /*stderr*/ false,
 		"TOTAL FRAME DROPS: {} (out of {} frames sent)\n", totalDrops, totalSent);
