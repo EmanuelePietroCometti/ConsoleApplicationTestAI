@@ -1,12 +1,15 @@
-// ConsoleApplicationTestAI.cpp : Questo file contiene la funzione 'main', in cui inizia e termina l'esecuzione del programma.
-//
-
 #include "Windows.h"
+#include <timeapi.h>      // timeBeginPeriod / timeEndPeriod
 #include "conio.h"
 #include <atomic>
 #include <chrono>
 #include <iostream>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <optional>
+#include <utility>
 #include <tchar.h>
 #include <string>
 #include <filesystem>
@@ -17,7 +20,9 @@
 #include <fmt/core.h>
 #include <fmt/color.h>
 
-#define NUM_CONTROL_POINTS 3
+#pragma comment(lib, "winmm.lib")   // timeBeginPeriod / timeEndPeriod
+
+#define NUM_CONTROL_POINTS 1
 
 enum class InferenceState : WORD {
 	IDLE = 0,
@@ -85,6 +90,95 @@ struct ScopedMutex {
 	}
 };
 
+// ============================================================================
+//  ASYNC LOGGER
+//  Tutto l'output su console passa da un unico thread consumatore. Il percorso
+//  caldo (thread frame-grabber) fa solo fmt::format + push in coda sotto un
+//  mutex tenuto per pochi microsecondi: NESSUNA scrittura su console nel loop
+//  temporizzato. Questo elimina:
+//    - il blocco da console-lock globale di Windows dentro la sezione temporizzata
+//    - il feedback loop "piu' drop -> piu' stampe -> piu' jitter -> piu' drop"
+//  Un solo writer garantisce inoltre righe non interlacciate tra thread.
+// ============================================================================
+class AsyncLogger {
+public:
+	AsyncLogger() : running_(true) {
+		worker_ = std::thread(&AsyncLogger::run, this);
+	}
+	~AsyncLogger() { stop(); }
+
+	AsyncLogger(const AsyncLogger&) = delete;
+	AsyncLogger& operator=(const AsyncLogger&) = delete;
+
+	void log(std::string text, bool toStderr = false,
+		std::optional<fmt::color> color = std::nullopt) {
+			{
+				std::lock_guard<std::mutex> lk(mtx_);
+				queue_.push_back(Entry{ std::move(text), toStderr, color });
+			}
+			cv_.notify_one();
+	}
+
+	// Svuota la coda e ferma il worker. Idempotente: la seconda chiamata
+	// (es. dal distruttore statico) esce subito.
+	void stop() {
+		if (!running_.exchange(false)) return;
+		cv_.notify_one();
+		if (worker_.joinable()) worker_.join();
+	}
+
+private:
+	struct Entry {
+		std::string text;
+		bool toStderr;
+		std::optional<fmt::color> color;
+	};
+
+	void run() {
+		std::unique_lock<std::mutex> lk(mtx_);
+		for (;;) {
+			cv_.wait(lk, [&] { return !queue_.empty() || !running_.load(); });
+			while (!queue_.empty()) {
+				Entry e = std::move(queue_.front());
+				queue_.pop_front();
+				lk.unlock();
+				FILE* out = e.toStderr ? stderr : stdout;
+				if (e.color) fmt::print(out, fg(*e.color), "{}", e.text);
+				else         fmt::print(out, "{}", e.text);
+				lk.lock();
+			}
+			if (!running_.load()) break;   // coda vuota e in fase di stop
+		}
+	}
+
+	std::mutex mtx_;
+	std::condition_variable cv_;
+	std::deque<Entry> queue_;
+	std::thread worker_;
+	std::atomic<bool> running_;
+};
+
+// Meyers singleton: costruito alla prima chiamata (dentro wmain), distrutto
+// all'uscita del processo. Evita problemi di ordine di init statico.
+static AsyncLogger& logger() {
+	static AsyncLogger inst;
+	return inst;
+}
+
+// Helper: formattano il messaggio e lo accodano. Sostituiscono fmt::print.
+template <typename... Args>
+static void LOG(fmt::format_string<Args...> f, Args&&... a) {
+	logger().log(fmt::format(f, std::forward<Args>(a)...), /*stderr*/ false);
+}
+template <typename... Args>
+static void LOGE(fmt::format_string<Args...> f, Args&&... a) {
+	logger().log(fmt::format(f, std::forward<Args>(a)...), /*stderr*/ true);
+}
+template <typename... Args>
+static void LOGC(fmt::color c, bool toStderr, fmt::format_string<Args...> f, Args&&... a) {
+	logger().log(fmt::format(f, std::forward<Args>(a)...), toStderr, c);
+}
+
 // Runtime configuration (overridable via command line, see wmain)
 std::filesystem::path g_inputFolder = L"D:\\emanuele\\Code\\ConsoleApplicationTestAI\\dataset";
 std::wstring g_modelPath = L"D:\\emanuele\\Code\\ConsoleApplicationTestAI\\model\\yolo_pure.onnx";
@@ -101,7 +195,7 @@ HANDLE hControlPointResults[NUM_CONTROL_POINTS];
 HANDLE hListMutex = NULL;
 HANDLE hListEventTrigger = NULL;
 HANDLE hListEventAck = NULL;
-int frameRate_milliseconds = 60;
+int frameRate_milliseconds = 15;
 
 // Per-control-point statistics, printed once the program terminates
 std::atomic<unsigned long> g_frameDropCount[NUM_CONTROL_POINTS];
@@ -115,6 +209,11 @@ static std::string ToNarrow(const std::wstring& wide) {
 
 void controlPointThreadFunc(int i)
 {
+	// Con la risoluzione del timer a 1 ms il jitter residuo viene dallo
+	// scheduling: alziamo la priorita' del produttore per avvicinarci alla
+	// cadenza hardware.
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
 	// Map INPUT IMAGE (Sender -> AI)
 	int nPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY * cpListMMF->points[i].bpp / 8;
 	std::wstring pName = L"MMF_" + std::to_wstring(cpListMMF->points[i].idPunto) + L"_IMAGE";
@@ -150,10 +249,10 @@ void controlPointThreadFunc(int i)
 		}
 	}
 	catch (const std::exception& e) {
-		fmt::print(stderr, "### ERROR reading directory: {}\n", e.what());
+		LOGE("### ERROR reading directory: {}\n", e.what());
 	}
 
-	fmt::print("Thread {} running (Simulating Frame Grabber). Loaded {} images.\n", i, imagePaths.size());
+	LOG("Thread {} running (Simulating Frame Grabber). Loaded {} images.\n", i, imagePaths.size());
 
 	int imageIndex = 0;
 	std::string lastSentFilename = "NONE";
@@ -174,7 +273,7 @@ void controlPointThreadFunc(int i)
 
 		cv::Mat img = cv::imread(currentImagePath, cv::IMREAD_COLOR);
 		if (img.empty()) {
-			fmt::print(stderr, "### ERROR: Failed to decode {}\n", stagedFilename);
+			LOGE("### ERROR: Failed to decode {}\n", stagedFilename);
 		}
 		else {
 			// Force resize to match the Shared Memory allocated layout
@@ -183,7 +282,7 @@ void controlPointThreadFunc(int i)
 
 		// Advance the index and loop back if we hit the end of the folder
 		imageIndex = (imageIndex + 1) % static_cast<int>(imagePaths.size());
-	};
+		};
 
 	// Copies the staged frame into shared memory and triggers the AI engine.
 	// Must be called with hControlPointMutex[i] held.
@@ -207,7 +306,7 @@ void controlPointThreadFunc(int i)
 		g_framesSent[i]++;
 		ResetEvent(hControlPointResults[i]);
 		SetEvent(hControlPointEvent[i]);
-	};
+		};
 
 	// Stage the first frame before entering the timed loop. The trigger cadence
 	// is hardware-faithful from t0: a real camera cannot be slowed down, so no
@@ -217,9 +316,12 @@ void controlPointThreadFunc(int i)
 	// and is reported and counted as such.
 	stageNextFrame();
 
-	// HARDWARE TRIGGER SIMULATION: strict interval from the start
+	// HARDWARE TRIGGER SIMULATION: strict interval from the start.
+	// Nota: la temporizzazione affidabile a <16 ms dipende da timeBeginPeriod(1)
+	// gia' attivato in wmain; senza quello il tick di sistema (~15,6 ms)
+	// quantizzerebbe sleep_until e i 20 ms diventerebbero instabili.
 	const auto hardwareTriggerInterval = std::chrono::milliseconds(frameRate_milliseconds);
-	auto next_trigger_time = std::chrono::high_resolution_clock::now() + hardwareTriggerInterval;
+	auto next_trigger_time = std::chrono::steady_clock::now() + hardwareTriggerInterval;
 
 	bool keepRunning = true;
 
@@ -229,98 +331,114 @@ void controlPointThreadFunc(int i)
 		next_trigger_time += hardwareTriggerInterval;
 
 		bool frameSent = false;
-		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
+		bool frameDropped = false;
 
+		// Copie locali del risultato del frame precedente: il parsing e le
+		// stampe avvengono FUORI dal lock, sulla copia, non sulla memoria
+		// condivisa (che il worker puo' riscrivere subito dopo il release).
+		InferenceState prevState = InferenceState::IDLE;
+		InferenceType  prevType = cpListMMF->points[i].inferenceType;
+		wchar_t        jsonCopy[1024] = { 0 };
+
+		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 		if (dwWaitResult == WAIT_OBJECT_0 || dwWaitResult == WAIT_ABANDONED)
 		{
 			if (cpListMMF->points[i].status == PointState::QUIT) {
 				keepRunning = false;
 			}
+			else if (cpListMMF->points[i].results.state == InferenceState::PENDING) {
+				// L'inferenza precedente non ha ancora finito: frame drop.
+				g_frameDropCount[i]++;
+				frameDropped = true;
+			}
 			else
 			{
-				if (cpListMMF->points[i].results.state == InferenceState::PENDING) {
-					g_frameDropCount[i]++;
-					fmt::print(stderr, fg(fmt::color::yellow),
-						"### WARNING: FRAME DROP DETECTED ON CP {}! AI execution exceeded timeframe (drops so far: {}).\n",
-						i, g_frameDropCount[i].load());
+				// Copia il risultato del frame precedente PRIMA di sovrascrivere
+				// lo stato con sendStagedFrame() (che lo mette a PENDING).
+				prevState = cpListMMF->points[i].results.state;
+				prevType = cpListMMF->points[i].inferenceType;
+				if (prevState == InferenceState::RESULT_READY) {
+					memcpy(jsonCopy, cpListMMF->points[i].results.json, sizeof(jsonCopy));
 				}
-				else
-				{
-					// READ RESULTS OF THE PREVIOUS FRAME
-					if (cpListMMF->points[i].results.state == InferenceState::RESULT_READY) {
 
-						// The JSON payload is plain ASCII: convert it once and parse narrow
-						std::wstring jsonW(cpListMMF->points[i].results.json);
-						const wchar_t* p = cpListMMF->points[i].results.json;
-						std::string jsonStr;
-						jsonStr.reserve(wcsnlen(p, 1024));
-						for (size_t k = 0; k < 1024 && p[k]; ++k)
-							jsonStr.push_back(static_cast<char>(p[k]));  // cast esplicito -> niente C4244
-
-						if (cpListMMF->points[i].inferenceType == InferenceType::ANOMALY) {
-							float anomalyScore = -1.0f;
-							std::string status = "UNKNOWN";
-
-							// nlohmann/json emits compact JSON: {"anomaly_score":0.123,"status":"OK"}
-							const std::string scoreKey = "\"anomaly_score\":";
-							size_t scorePos = jsonStr.find(scoreKey);
-							if (scorePos != std::string::npos) {
-								try { anomalyScore = std::stof(jsonStr.substr(scorePos + scoreKey.length())); }
-								catch (const std::exception& e) {
-									fmt::print(stderr, "Exception occurred: {}\n", e.what());
-								}
-							}
-
-							const std::string statusKey = "\"status\":\"";
-							size_t statusPos = jsonStr.find(statusKey);
-							if (statusPos != std::string::npos) {
-								size_t valStart = statusPos + statusKey.length();
-								size_t valEnd = jsonStr.find('"', valStart);
-								if (valEnd != std::string::npos) {
-									status = jsonStr.substr(valStart, valEnd - valStart);
-								}
-							}
-
-							fmt::print(">> CP {} | FILE: {} | ANOMALY_SCORE: {} | STATUS: {}\n",
-								i, lastSentFilename, anomalyScore, status);
-						}
-						else if (cpListMMF->points[i].inferenceType == InferenceType::CLASSIFICATION) {
-							float confidence = -1.0f;
-							int class_id = -1;
-
-							const std::string confKey = "\"confidence\":";
-							size_t confPos = jsonStr.find(confKey);
-							if (confPos != std::string::npos) {
-								try { confidence = std::stof(jsonStr.substr(confPos + confKey.length())); }
-								catch (const std::exception& e) {
-									fmt::print(stderr, "Exception occurred: {}\n", e.what());
-								}
-							}
-
-							const std::string classKey = "\"class_id\":";
-							size_t classPos = jsonStr.find(classKey);
-							if (classPos != std::string::npos) {
-								try { class_id = std::stoi(jsonStr.substr(classPos + classKey.length())); }
-								catch (const std::exception& e) {
-									fmt::print(stderr, "Exception occurred: {}\n", e.what());
-								}
-							}
-
-							// Print the result alongside the exact filename that generated it
-							fmt::print(">> CP {} | FILE: {} | PRED_CLASS: {} | CONFIDENCE: {}\n",
-								i, lastSentFilename, class_id, confidence);
-						}
-					}
-					else if (cpListMMF->points[i].results.state == InferenceState::ERROR_DETECTED) {
-						fmt::print(stderr, "### POINT {} AI ERROR DETECTED!\n", i);
-					}
-
-					// --- WRITE THE (PRE-DECODED) FRAME INTO SHARED MEMORY AND TRIGGER ---
-					sendStagedFrame();
-					frameSent = true;
-				}
+				// Scrive il frame (pre-decodificato) in shared memory e triggera.
+				sendStagedFrame();
+				frameSent = true;
 			}
 			ReleaseMutex(hControlPointMutex[i]);
+		}
+
+		if (frameDropped) {
+			LOGC(fmt::color::yellow, /*stderr*/ true,
+				"### WARNING: FRAME DROP DETECTED ON CP {}! AI execution exceeded timeframe (drops so far: {}).\n",
+				i, g_frameDropCount[i].load());
+		}
+
+		if (prevState == InferenceState::RESULT_READY) {
+
+			// The JSON payload is plain ASCII: convert it once and parse narrow
+			const wchar_t* p = jsonCopy;
+			std::string jsonStr;
+			jsonStr.reserve(wcsnlen(p, 1024));
+			for (size_t k = 0; k < 1024 && p[k]; ++k)
+				jsonStr.push_back(static_cast<char>(p[k]));  // cast esplicito -> niente C4244
+
+			if (prevType == InferenceType::ANOMALY) {
+				float anomalyScore = -1.0f;
+				std::string status = "UNKNOWN";
+
+				// nlohmann/json emits compact JSON: {"anomaly_score":0.123,"status":"OK"}
+				const std::string scoreKey = "\"anomaly_score\":";
+				size_t scorePos = jsonStr.find(scoreKey);
+				if (scorePos != std::string::npos) {
+					try { anomalyScore = std::stof(jsonStr.substr(scorePos + scoreKey.length())); }
+					catch (const std::exception& e) {
+						LOGE("Exception occurred: {}\n", e.what());
+					}
+				}
+
+				const std::string statusKey = "\"status\":\"";
+				size_t statusPos = jsonStr.find(statusKey);
+				if (statusPos != std::string::npos) {
+					size_t valStart = statusPos + statusKey.length();
+					size_t valEnd = jsonStr.find('"', valStart);
+					if (valEnd != std::string::npos) {
+						status = jsonStr.substr(valStart, valEnd - valStart);
+					}
+				}
+
+				LOG(">> CP {} | FILE: {} | ANOMALY_SCORE: {} | STATUS: {}\n",
+					i, lastSentFilename, anomalyScore, status);
+			}
+			else if (prevType == InferenceType::CLASSIFICATION) {
+				float confidence = -1.0f;
+				int class_id = -1;
+
+				const std::string confKey = "\"confidence\":";
+				size_t confPos = jsonStr.find(confKey);
+				if (confPos != std::string::npos) {
+					try { confidence = std::stof(jsonStr.substr(confPos + confKey.length())); }
+					catch (const std::exception& e) {
+						LOGE("Exception occurred: {}\n", e.what());
+					}
+				}
+
+				const std::string classKey = "\"class_id\":";
+				size_t classPos = jsonStr.find(classKey);
+				if (classPos != std::string::npos) {
+					try { class_id = std::stoi(jsonStr.substr(classPos + classKey.length())); }
+					catch (const std::exception& e) {
+						LOGE("Exception occurred: {}\n", e.what());
+					}
+				}
+
+				// Print the result alongside the exact filename that generated it
+				LOG(">> CP {} | FILE: {} | PRED_CLASS: {} | CONFIDENCE: {}\n",
+					i, lastSentFilename, class_id, confidence);
+			}
+		}
+		else if (prevState == InferenceState::ERROR_DETECTED) {
+			LOGE("### POINT {} AI ERROR DETECTED!\n", i);
 		}
 
 		// Prepare the next frame during the idle time until the next trigger.
@@ -335,7 +453,7 @@ void controlPointThreadFunc(int i)
 	if (pResImage) UnmapViewOfFile(pResImage);
 	if (hMMFResImage) CloseHandle(hMMFResImage);
 
-	fmt::print("Thread {} stopped! (frames sent: {}, frame drops: {})\n",
+	LOG("Thread {} stopped! (frames sent: {}, frame drops: {})\n",
 		i, g_framesSent[i].load(), g_frameDropCount[i].load());
 }
 
@@ -366,16 +484,16 @@ void Quit() {
 
 		DWORD ackWait = WaitForSingleObject(hListEventAck, 3000);
 		if (ackWait == WAIT_OBJECT_0) {
-			fmt::print("ONNX manager shutdown acknowledged.\n");
+			LOG("ONNX manager shutdown acknowledged.\n");
 		}
 		else {
-			fmt::print("### ONNX manager shutdown timeout!\n");
+			LOG("### ONNX manager shutdown timeout!\n");
 		}
 		break;
 	}
 	case WAIT_TIMEOUT:
 	{
-		fmt::print("Main thread waiting for the global mutex!\n");
+		LOG("Main thread waiting for the global mutex!\n");
 		break;
 	}
 	}
@@ -385,7 +503,7 @@ void Start()
 {
 	static bool isStarted = false;
 	if (isStarted) {
-		fmt::print("### WARNING: Simulation already running!\n");
+		LOG("### WARNING: Simulation already running!\n");
 		return;
 	}
 	isStarted = true;
@@ -408,10 +526,10 @@ void createMutex(HANDLE& hMutex, int i) {
 	hMutex = CreateMutex(NULL, FALSE, name);
 
 	if (hMutex == NULL) {
-		fmt::print(stderr, "CreateMutex error: {}\n", GetLastError());
+		LOGE("CreateMutex error: {}\n", GetLastError());
 	}
 	else {
-		fmt::print("CreateMutex {}: {}\n",
+		LOG("CreateMutex {}: {}\n",
 			(GetLastError() == ERROR_ALREADY_EXISTS) ? "opened existing" : "created new", ToNarrow(name));
 	}
 }
@@ -433,10 +551,10 @@ void createEvent(HANDLE& hEvent, int i, const std::wstring& suffix) {
 	hEvent = CreateEvent(NULL, FALSE, FALSE, name);
 
 	if (hEvent == NULL) {
-		fmt::print(stderr, "CreateEvent error: {}\n", GetLastError());
+		LOGE("CreateEvent error: {}\n", GetLastError());
 	}
 	else {
-		fmt::print("CreateEvent {}: {}\n",
+		LOG("CreateEvent {}: {}\n",
 			(GetLastError() == ERROR_ALREADY_EXISTS) ? "opened existing" : "created new", ToNarrow(name));
 	}
 }
@@ -481,17 +599,17 @@ bool Configure()
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
-		fmt::print("Release the global mutex\n");
+		LOG("Release the global mutex\n");
 		if (!ReleaseMutex(hListMutex))
 		{
-			fmt::print(stderr, "### Release global mutex error\n");
+			LOGE("### Release global mutex error\n");
 		}
 
 		// Notify the AI to start configuration (and TensorRT warmup)
 		SetEvent(hListEventTrigger);
 
-		fmt::print(">> Waiting for AI engine configuration...\n");
-		fmt::print(">> [NOTE: First-time TensorRT optimization takes time. Press 'q' to abort]\n");
+		LOG(">> Waiting for AI engine configuration...\n");
+		LOG(">> [NOTE: First-time TensorRT optimization takes time. Press 'q' to abort]\n");
 
 		bool ackReceived = false;
 		bool abortRequested = false;
@@ -519,7 +637,7 @@ bool Configure()
 
 		// If 'q' was pressed, interrupt cleanly and immediately
 		if (abortRequested) {
-			fmt::print("### WARNING: Configuration interrupted by user. Initiating shutdown...\n");
+			LOG("### WARNING: Configuration interrupted by user. Initiating shutdown...\n");
 			Quit();
 			return false;
 		}
@@ -527,11 +645,11 @@ bool Configure()
 		// Update the global state
 		WaitForSingleObject(hListMutex, INFINITE);
 		if (cpListMMF->state == ListState::CONFIGURED) {
-			fmt::print("Configuration control points completed!\n");
+			LOG("Configuration control points completed!\n");
 			isConfigured = true;
 		}
 		else {
-			fmt::print(stderr, "### ERROR: control points configuration failed.\n");
+			LOGE("### ERROR: control points configuration failed.\n");
 		}
 		ReleaseMutex(hListMutex);
 
@@ -539,7 +657,7 @@ bool Configure()
 	}
 	case WAIT_TIMEOUT:
 	{
-		fmt::print("Main thread waiting for the global mutex!\n");
+		LOG("Main thread waiting for the global mutex!\n");
 		break;
 	}
 	}
@@ -585,24 +703,34 @@ bool parseInferenceType(std::wstring value, InferenceType& outType)
 
 int wmain(int argc, wchar_t* argv[])
 {
-	fmt::print("DELTA VISIONE - Test AI via MMF + ONNX!\n");
+	// Alza la risoluzione del timer di sistema a 1 ms per TUTTA la durata del
+	// processo. Senza questo, il tick di sistema (~15,6 ms) quantizza
+	// sleep_until: gli intervalli sotto ~16 ms sono impossibili da temporizzare
+	// e i 20 ms oscillano tra 1 e 2 tick, causando frame drop.
+	timeBeginPeriod(1);
+
+	LOG("DELTA VISIONE - Test AI via MMF + ONNX!\n");
 
 	// Optional positional arguments; defaults defined at the top of the file
-	// Usage: ConsoleApplicationTestAI.exe [inputFolder] [modelPath] [anomaly|classification|object_detection]
+	// Usage: ConsoleApplicationTestAI.exe [inputFolder] [modelPath] [anomaly|classification|object_detection] [frameRateMs]
 	if (argc > 1) {
 		g_inputFolder = argv[1];
 	}
 	if (argc > 2) {
 		g_modelPath = argv[2];
 		if (g_modelPath.length() >= 512) {
-			fmt::print(stderr, "### ERROR: model path exceeds 511 characters.\n");
+			LOGE("### ERROR: model path exceeds 511 characters.\n");
+			logger().stop();
+			timeEndPeriod(1);
 			return 1;
 		}
 	}
 	if (argc > 3) {
 		if (!parseInferenceType(argv[3], g_inferenceType)) {
-			fmt::print(stderr, "### ERROR: unknown analysis type '{}'. Valid values: anomaly (0), classification (1), object_detection (2).\n",
+			LOGE("### ERROR: unknown analysis type '{}'. Valid values: anomaly (0), classification (1), object_detection (2).\n",
 				ToNarrow(argv[3]));
+			logger().stop();
+			timeEndPeriod(1);
 			return 1;
 		}
 	}
@@ -612,19 +740,21 @@ int wmain(int argc, wchar_t* argv[])
 			frameRate_milliseconds = std::stoi(argv[4]);
 		}
 		catch (const std::exception&) {
-			fmt::print(stderr, "### ERROR: invalid frame rate value: '{}'. Must be an integer.\n", ToNarrow(argv[4]));
+			LOGE("### ERROR: invalid frame rate value: '{}'. Must be an integer.\n", ToNarrow(argv[4]));
+			logger().stop();
+			timeEndPeriod(1);
 			return 1;
 		}
 	}
 
 	if (!std::filesystem::is_directory(g_inputFolder)) {
-		fmt::print(stderr, "### WARNING: input folder does not exist or is not a directory: {}\n", g_inputFolder.string());
+		LOGE("### WARNING: input folder does not exist or is not a directory: {}\n", g_inputFolder.string());
 	}
 	if (!std::filesystem::is_regular_file(g_modelPath)) {
-		fmt::print(stderr, "### WARNING: model file not found: {}\n", ToNarrow(g_modelPath));
+		LOGE("### WARNING: model file not found: {}\n", ToNarrow(g_modelPath));
 	}
 
-	fmt::print(">> Input folder : {}\n"
+	LOG(">> Input folder : {}\n"
 		">> Model path   : {}\n"
 		">> Analysis type: {}\n"
 		">> Trigger rate : {} ms\n\n",
@@ -657,12 +787,14 @@ int wmain(int argc, wchar_t* argv[])
 		wcscpy_s(cpListMMF->listEventAckName, 128, TEXT("LISTEVENTACK"));
 	}
 	else {
-		fmt::print(stderr, "Could not map view of file ({}).\n", GetLastError());
+		LOGE("Could not map view of file ({}).\n", GetLastError());
 		CloseHandle(hcpListMMF);
+		logger().stop();
+		timeEndPeriod(1);
 		return 1;
 	}
 
-	fmt::print("Press 'q' to quit, press 'c' to configure, press 's' to start sim\n");
+	LOG("Press 'q' to quit, press 'c' to configure, press 's' to start sim\n");
 
 	bool isRunning = true;
 	bool isConfigured = false;
@@ -680,7 +812,7 @@ int wmain(int argc, wchar_t* argv[])
 					isConfigured = Configure();
 				}
 				if (!isConfigured) {
-					fmt::print(stderr, "### ERROR: Configuration failed...starting shutdown!\n");
+					LOGE("### ERROR: Configuration failed...starting shutdown!\n");
 					Quit();
 				}
 				break;
@@ -691,13 +823,13 @@ int wmain(int argc, wchar_t* argv[])
 					Start();
 				}
 				else {
-					fmt::print(stderr, "### ERROR: Configure before starting!\n");
+					LOGE("### ERROR: Configure before starting!\n");
 				}
 				break;
 			}
 
 			case 'q':
-				fmt::print("Initiating shutdown sequence...\n");
+				LOG("Initiating shutdown sequence...\n");
 				Quit();
 				break;
 
@@ -736,20 +868,27 @@ int wmain(int argc, wchar_t* argv[])
 	CloseHandle(hListEventTrigger);
 	CloseHandle(hListEventAck);
 
-	// --- FINAL RUN SUMMARY ---
+	// FINAL RUN SUMMARY
 	unsigned long totalDrops = 0;
 	unsigned long totalSent = 0;
-	fmt::print("\n============ RUN SUMMARY ============\n");
+	LOG("\n============ RUN SUMMARY ============\n");
 	for (int i = 0; i < NUM_CONTROL_POINTS; i++) {
 		const unsigned long drops = g_frameDropCount[i].load();
 		const unsigned long sent = g_framesSent[i].load();
 		totalDrops += drops;
 		totalSent += sent;
-		fmt::print("CP {} | frames sent: {:6} | frame drops: {}\n", i, sent, drops);
+		LOG("CP {} | frames sent: {:6} | frame drops: {}\n", i, sent, drops);
 	}
-	fmt::print(totalDrops > 0 ? fg(fmt::color::red) : fg(fmt::color::green),
+	LOGC(totalDrops > 0 ? fmt::color::red : fmt::color::green, /*stderr*/ false,
 		"TOTAL FRAME DROPS: {} (out of {} frames sent)\n", totalDrops, totalSent);
-	fmt::print("=====================================\n");
+	LOG("=====================================\n");
+
+	// Smaltisce coda e ferma il logger PRIMA di ripristinare il timer e uscire, cosi'
+	// il summary viene effettivamente stampato prima della terminazione.
+	logger().stop();
+
+	// Ripristina la risoluzione del timer di sistema.
+	timeEndPeriod(1);
 }
 
 // Per eseguire il programma: CTRL+F5 oppure Debug > Avvia senza eseguire debug
