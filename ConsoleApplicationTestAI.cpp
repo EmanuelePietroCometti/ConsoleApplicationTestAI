@@ -23,7 +23,7 @@
 
 #pragma comment(lib, "winmm.lib")   // timeBeginPeriod / timeEndPeriod
 
-#define NUM_CONTROL_POINTS 1
+int num_control_points; // numero di control points da simulare
 
 enum class InferenceState : WORD {
 	IDLE = 0,
@@ -190,10 +190,10 @@ InferenceType g_inferenceType = InferenceType::CLASSIFICATION;
 HANDLE hcpListMMF = NULL;
 PTcontrolPointsList cpListMMF = NULL;
 
-std::thread threads[NUM_CONTROL_POINTS];
-HANDLE hControlPointMutex[NUM_CONTROL_POINTS];
-HANDLE hControlPointEvent[NUM_CONTROL_POINTS];
-HANDLE hControlPointResults[NUM_CONTROL_POINTS];
+std::vector<std::thread> threads;
+std::vector<HANDLE> hControlPointMutex;
+std::vector<HANDLE> hControlPointEvent;
+std::vector<HANDLE> hControlPointResults;
 
 HANDLE hListMutex = NULL;
 HANDLE hListEventTrigger = NULL;
@@ -213,7 +213,7 @@ struct WaitStats {
 	long long minWaitUs = 0;
 	long long maxWaitUs = 0;
 };
-WaitStats g_stats[NUM_CONTROL_POINTS];
+std::vector<WaitStats> g_stats;
 
 // Convert wide strings coming from the IPC structs / command line so all
 // logging can go through narrow fmt::print (avoids mixing stream orientations)
@@ -553,7 +553,7 @@ void controlPointThreadFunc(int i)
 	if (hMMFResImage) CloseHandle(hMMFResImage);
 
 	if (stats.acksReceived == 0) stats.minWaitUs = 0;
-	g_stats[i] = stats;   // la join in wmain sincronizza la lettura
+	g_stats.emplace_back(stats);   // la join in wmain sincronizza la lettura
 
 	LOG("Thread {} stopped! (frames sent: {}, results: {}, frame drops: {}, missed ticks: {})\n",
 		i, stats.framesSent, stats.acksReceived, stats.frameDrops, stats.missedTicks);
@@ -569,7 +569,7 @@ void Quit() {
 	{
 		__try {
 			cpListMMF->state = ListState::QUIT;
-			for (int i = 0; i < NUM_CONTROL_POINTS; i++) {
+			for (int i = 0; i < num_control_points; i++) {
 				DWORD innerMutexWait = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 				if (innerMutexWait == WAIT_OBJECT_0 || innerMutexWait == WAIT_ABANDONED) {
 					cpListMMF->points[i].status = PointState::QUIT;
@@ -612,10 +612,10 @@ void Start()
 		return;
 	}
 	isStarted = true;
-	for (int i = 0; i < NUM_CONTROL_POINTS; i++)
+	for (int i = 0; i < num_control_points; i++)
 	{
-		threads[i] = std::thread(controlPointThreadFunc, i);
-		//std::this_thread::sleep_for(std::chrono::milliseconds(30));
+		threads.emplace_back(std::thread(controlPointThreadFunc, i));
+		std::this_thread::sleep_for(std::chrono::milliseconds(30));
 	}
 }
 
@@ -680,10 +680,10 @@ bool Configure()
 		cpListMMF->state = ListState::UPDATE_PENDING;
 
 		ZeroMemory(cpListMMF->points, sizeof(controlPoint) * 1024);
-		cpListMMF->numPunti = NUM_CONTROL_POINTS;
+		cpListMMF->numPunti = num_control_points;
 		DWORD nRand = rand();
 
-		for (int i = 0; i < NUM_CONTROL_POINTS; i++)
+		for (int i = 0; i < num_control_points; i++)
 		{
 			cpListMMF->points[i].idPunto = nRand + i;
 			cpListMMF->points[i].sizeX = 512;
@@ -886,6 +886,26 @@ int wmain(int argc, wchar_t* argv[])
 		}
 	}
 
+	if (argc > 6) {
+		try {
+			num_control_points = std::stoi(argv[6]);
+			if (num_control_points <= 0) {
+				LOGE("### ERROR: number of control points must be a positive number of milliseconds.\n");
+				logger().stop();
+				timeEndPeriod(1);
+				return 1;
+			}
+		}
+		catch (const std::exception&) {
+			LOGE("### ERROR: invalid number of control points value: '{}'. Must be an integer.\n", ToNarrow(argv[6]));
+			logger().stop();
+			timeEndPeriod(1);
+			return 1;
+		}
+	}
+
+
+
 	if (!std::filesystem::is_directory(g_inputFolder)) {
 		LOGE("### WARNING: input folder does not exist or is not a directory: {}\n", g_inputFolder.string());
 	}
@@ -912,9 +932,9 @@ int wmain(int argc, wchar_t* argv[])
 	hListEventAck = CreateEvent(NULL, FALSE, FALSE, TEXT("LISTEVENTACK"));
 
 
-	ZeroMemory(hControlPointMutex, sizeof(HANDLE) * NUM_CONTROL_POINTS);
-	ZeroMemory(hControlPointEvent, sizeof(HANDLE) * NUM_CONTROL_POINTS);
-	ZeroMemory(hControlPointResults, sizeof(HANDLE) * NUM_CONTROL_POINTS);
+	hControlPointMutex.assign(num_control_points, 0);
+	hControlPointEvent.assign(num_control_points, 0);
+	hControlPointResults.assign(num_control_points, 0);
 
 	hcpListMMF = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(controlPointsList), L"CONTROLPOINTLIST");
 	DWORD dwErr = GetLastError();
@@ -999,7 +1019,7 @@ int wmain(int argc, wchar_t* argv[])
 		}
 	}
 
-	for (size_t i = 0; i < NUM_CONTROL_POINTS; i++)
+	for (size_t i = 0; i < num_control_points; i++)
 	{
 		if (threads[i].joinable()) {
 			threads[i].join();
@@ -1017,7 +1037,7 @@ int wmain(int argc, wchar_t* argv[])
 	unsigned long totalDrops = 0;
 	unsigned long totalSent = 0;
 	LOG("\n===================== RUN SUMMARY =====================\n");
-	for (int i = 0; i < NUM_CONTROL_POINTS; i++) {
+	for (int i = 0; i < num_control_points; i++) {
 		const WaitStats& s = g_stats[i];
 		totalDrops += s.frameDrops;
 		totalSent += s.framesSent;
