@@ -349,8 +349,7 @@ void controlPointThreadFunc(int i)
 		// Attesa dell'ack: INFINITE e' sicuro perche' Quit() segnala anche
 		// questo evento per sbloccare il thread in fase di shutdown.
 		WaitForSingleObject(hControlPointResults[i], INFINITE);
-		const long long waitUs = std::chrono::duration_cast<std::chrono::microseconds>(
-			std::chrono::steady_clock::now() - triggerTime).count();
+		const auto ackTime = std::chrono::steady_clock::now();
 
 		// Il file a cui si riferisce l'ack appena ricevuto: va catturato PRIMA
 		// che sendStagedFrame() lo sovrascriva con il frame successivo.
@@ -362,6 +361,7 @@ void controlPointThreadFunc(int i)
 		InferenceState prevState = InferenceState::IDLE;
 		InferenceType  prevType = g_inferenceType;
 		wchar_t        jsonCopy[1024] = { 0 };
+		long long      waitUs = 0;   // valido solo se prevState == RESULT_READY
 
 		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 		if (dwWaitResult == WAIT_OBJECT_0 || dwWaitResult == WAIT_ABANDONED)
@@ -377,6 +377,10 @@ void controlPointThreadFunc(int i)
 				prevType = cpListMMF->points[i].inferenceType;
 				if (prevState == InferenceState::RESULT_READY) {
 					memcpy(jsonCopy, cpListMMF->points[i].results.json, sizeof(jsonCopy));
+					// Il timer si ferma SOLO su un risultato valido: risvegli con
+					// stato diverso (es. ERROR_DETECTED) non entrano nella misura.
+					waitUs = std::chrono::duration_cast<std::chrono::microseconds>(
+						ackTime - triggerTime).count();
 				}
 
 				// Invia SUBITO il frame successivo, prima ancora di stampare.
@@ -388,12 +392,12 @@ void controlPointThreadFunc(int i)
 
 		if (!keepRunning) break;
 
-		stats.acksReceived++;
-		stats.totalWaitUs += waitUs;
-		if (waitUs < stats.minWaitUs) stats.minWaitUs = waitUs;
-		if (waitUs > stats.maxWaitUs) stats.maxWaitUs = waitUs;
-
 		if (prevState == InferenceState::RESULT_READY) {
+
+			stats.acksReceived++;
+			stats.totalWaitUs += waitUs;
+			if (waitUs < stats.minWaitUs) stats.minWaitUs = waitUs;
+			if (waitUs > stats.maxWaitUs) stats.maxWaitUs = waitUs;
 
 			// The JSON payload is plain ASCII: convert it once and parse narrow
 			const wchar_t* p = jsonCopy;
