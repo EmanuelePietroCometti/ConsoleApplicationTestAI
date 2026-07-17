@@ -1,5 +1,4 @@
 #include "Windows.h"
-#include <timeapi.h>      // timeBeginPeriod / timeEndPeriod
 #include "conio.h"
 #include <atomic>
 #include <chrono>
@@ -17,10 +16,9 @@
 #include <vector>
 #include <algorithm>
 #include <cwctype>
+#include <climits>
 #include <fmt/core.h>
 #include <fmt/color.h>
-
-#pragma comment(lib, "winmm.lib")   // timeBeginPeriod / timeEndPeriod
 
 #define NUM_CONTROL_POINTS 1
 
@@ -197,38 +195,24 @@ HANDLE hControlPointResults[NUM_CONTROL_POINTS];
 HANDLE hListMutex = NULL;
 HANDLE hListEventTrigger = NULL;
 HANDLE hListEventAck = NULL;
-int frameRate_milliseconds = 15;
 int g_triggerCore = -1;   // logical core for the trigger thread (-1 = no pinning)
 
-// Per-control-point statistics, printed once the program terminates
-std::atomic<unsigned long> g_frameDropCount[NUM_CONTROL_POINTS];
-std::atomic<unsigned long> g_framesSent[NUM_CONTROL_POINTS];
-// Tick saltati perche' il SIMULATORE si e' svegliato in ritardo di >= 1
-// intervallo intero: ritardi nostri, non dell'AI, contati a parte dai drop.
-std::atomic<unsigned long> g_missedTicks[NUM_CONTROL_POINTS];
-// Peggior ritardo di risveglio rispetto al tick teorico (telemetria).
-std::atomic<long long> g_maxWakeLateUs[NUM_CONTROL_POINTS];
+// Statistiche per control point sul tempo di attesa dell'ack (trigger ->
+// evento RESULTS con risultati pronti). Scritte dal thread del control point
+// prima di terminare, lette dal main dopo la join.
+struct WaitStats {
+	unsigned long framesSent = 0;   // frame inviati (trigger emessi)
+	unsigned long acksReceived = 0; // ack ricevuti (attese misurate)
+	long long totalWaitUs = 0;
+	long long minWaitUs = 0;
+	long long maxWaitUs = 0;
+};
+WaitStats g_stats[NUM_CONTROL_POINTS];
 
 // Convert wide strings coming from the IPC structs / command line so all
 // logging can go through narrow fmt::print (avoids mixing stream orientations)
 static std::string ToNarrow(const std::wstring& wide) {
 	return std::filesystem::path(wide).string();
-}
-
-// Attesa ibrida ad alta precisione: sleep_until fino a ~2 ms dal target
-// (economico, ma con jitter dello scheduler anche a timer 1 ms), poi
-// spin-wait per l'ultimo tratto (preciso al microsecondo). Con il thread
-// pinnato su un core libero il costo dello spin e' irrilevante.
-static void preciseWaitUntil(std::chrono::steady_clock::time_point target)
-{
-	constexpr auto kSpinWindow = std::chrono::milliseconds(2);
-	const auto sleepTarget = target - kSpinWindow;
-	if (std::chrono::steady_clock::now() < sleepTarget) {
-		std::this_thread::sleep_until(sleepTarget);
-	}
-	while (std::chrono::steady_clock::now() < target) {
-		YieldProcessor();
-	}
 }
 
 void controlPointThreadFunc(int i)
@@ -304,11 +288,14 @@ void controlPointThreadFunc(int i)
 		LOGE("### ERROR reading directory: {}\n", e.what());
 	}
 
-	LOG("Thread {} running (Simulating Frame Grabber). Preloaded {} frames ({} MB in RAM).\n",
+	LOG("Thread {} running (continuous loop: next frame sent as soon as the ACK arrives). Preloaded {} frames ({} MB in RAM).\n",
 		i, frames.size(), frames.size() * static_cast<size_t>(nPayload) / (1024 * 1024));
 
 	int imageIndex = 0;
 	std::string lastSentFilename = "NONE";
+
+	WaitStats stats;
+	stats.minWaitUs = LLONG_MAX;
 
 	// Copies the current preloaded frame into shared memory and triggers the
 	// AI engine. Must be called with hControlPointMutex[i] held.
@@ -330,50 +317,48 @@ void controlPointThreadFunc(int i)
 
 		// TRIGGER AI ENGINE FOR THE NEW FRAME
 		cpListMMF->points[i].results.state = InferenceState::PENDING;
-		g_framesSent[i]++;
+		stats.framesSent++;
 		ResetEvent(hControlPointResults[i]);
 		SetEvent(hControlPointEvent[i]);
 		};
 
-	// HARDWARE TRIGGER SIMULATION: strict interval from the start.
-	// Nota: la temporizzazione affidabile a <16 ms dipende da timeBeginPeriod(1)
-	// gia' attivato in wmain; senza quello il tick di sistema (~15,6 ms)
-	// quantizzerebbe sleep_until e i 20 ms diventerebbero instabili.
-	const auto hardwareTriggerInterval = std::chrono::milliseconds(frameRate_milliseconds);
-	auto next_trigger_time = std::chrono::steady_clock::now() + hardwareTriggerInterval;
-
+	// LOOP CONTINUO: nessun trigger temporizzato. Si invia un frame, si attende
+	// l'evento RESULTS (ack dell'AI con i risultati pronti) misurando quanto
+	// dura l'attesa, e si invia subito il frame successivo. Niente frame drop
+	// per definizione: il frame parte solo quando il precedente e' concluso.
+	std::chrono::steady_clock::time_point triggerTime;
 	bool keepRunning = true;
+
+	// Primo frame: da qui in poi il ritmo lo detta l'ack dell'AI.
+	{
+		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
+		if (dwWaitResult == WAIT_OBJECT_0 || dwWaitResult == WAIT_ABANDONED) {
+			if (cpListMMF->points[i].status == PointState::QUIT) {
+				keepRunning = false;
+			}
+			else {
+				sendStagedFrame();
+				triggerTime = std::chrono::steady_clock::now();
+			}
+			ReleaseMutex(hControlPointMutex[i]);
+		}
+	}
 
 	while (keepRunning)
 	{
-		preciseWaitUntil(next_trigger_time);
+		// Attesa dell'ack: INFINITE e' sicuro perche' Quit() segnala anche
+		// questo evento per sbloccare il thread in fase di shutdown.
+		WaitForSingleObject(hControlPointResults[i], INFINITE);
+		const long long waitUs = std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - triggerTime).count();
 
-		// Telemetria: quanto tardi ci siamo svegliati rispetto al tick teorico.
-		const auto now = std::chrono::steady_clock::now();
-		const long long lateUs =
-			std::chrono::duration_cast<std::chrono::microseconds>(now - next_trigger_time).count();
-		if (lateUs > g_maxWakeLateUs[i].load(std::memory_order_relaxed)) {
-			g_maxWakeLateUs[i].store(lateUs, std::memory_order_relaxed);
-		}
+		// Il file a cui si riferisce l'ack appena ricevuto: va catturato PRIMA
+		// che sendStagedFrame() lo sovrascriva con il frame successivo.
+		const std::string ackedFilename = lastSentFilename;
 
-		next_trigger_time += hardwareTriggerInterval;
-
-		// Se il risveglio e' in ritardo di uno o piu' intervalli INTERI, i tick
-		// persi vengono saltati, non recuperati in raffica: una camera reale
-		// non emette mai due trigger back-to-back. Il recupero a raffica
-		// trovava l'inferenza precedente ancora PENDING e generava falsi drop
-		// imputati all'AI. I tick saltati sono ritardi del simulatore e vanno
-		// nel contatore separato g_missedTicks.
-		while (next_trigger_time <= now) {
-			next_trigger_time += hardwareTriggerInterval;
-			g_missedTicks[i]++;
-		}
-
-		bool frameDropped = false;
-
-		// Copie locali del risultato del frame precedente: il parsing e le
-		// stampe avvengono FUORI dal lock, sulla copia, non sulla memoria
-		// condivisa (che il worker puo' riscrivere subito dopo il release).
+		// Copie locali del risultato: il parsing e le stampe avvengono FUORI
+		// dal lock, sulla copia, non sulla memoria condivisa (che il worker
+		// puo' riscrivere subito dopo il release).
 		InferenceState prevState = InferenceState::IDLE;
 		InferenceType  prevType = g_inferenceType;
 		wchar_t        jsonCopy[1024] = { 0 };
@@ -384,32 +369,29 @@ void controlPointThreadFunc(int i)
 			if (cpListMMF->points[i].status == PointState::QUIT) {
 				keepRunning = false;
 			}
-			else if (cpListMMF->points[i].results.state == InferenceState::PENDING) {
-				// L'inferenza precedente non ha ancora finito: frame drop.
-				g_frameDropCount[i]++;
-				frameDropped = true;
-			}
 			else
 			{
-				// Copia il risultato del frame precedente PRIMA di sovrascrivere
-				// lo stato con sendStagedFrame() (che lo mette a PENDING).
+				// Copia il risultato PRIMA di sovrascrivere lo stato con
+				// sendStagedFrame() (che lo mette a PENDING).
 				prevState = cpListMMF->points[i].results.state;
 				prevType = cpListMMF->points[i].inferenceType;
 				if (prevState == InferenceState::RESULT_READY) {
 					memcpy(jsonCopy, cpListMMF->points[i].results.json, sizeof(jsonCopy));
 				}
 
-				// Scrive il frame (pre-decodificato) in shared memory e triggera.
+				// Invia SUBITO il frame successivo, prima ancora di stampare.
 				sendStagedFrame();
+				triggerTime = std::chrono::steady_clock::now();
 			}
 			ReleaseMutex(hControlPointMutex[i]);
 		}
 
-		if (frameDropped) {
-			LOGC(fmt::color::yellow, /*stderr*/ true,
-				"### WARNING: FRAME DROP DETECTED ON CP {}! AI execution exceeded timeframe (drops so far: {}).\n",
-				i, g_frameDropCount[i].load());
-		}
+		if (!keepRunning) break;
+
+		stats.acksReceived++;
+		stats.totalWaitUs += waitUs;
+		if (waitUs < stats.minWaitUs) stats.minWaitUs = waitUs;
+		if (waitUs > stats.maxWaitUs) stats.maxWaitUs = waitUs;
 
 		if (prevState == InferenceState::RESULT_READY) {
 
@@ -444,8 +426,8 @@ void controlPointThreadFunc(int i)
 					}
 				}
 
-				LOG(">> CP {} | FILE: {} | ANOMALY_SCORE: {} | STATUS: {}\n",
-					i, lastSentFilename, anomalyScore, status);
+				LOG(">> CP {} | FILE: {} | ANOMALY_SCORE: {} | STATUS: {} | ACK WAIT: {:.3f} ms\n",
+					i, ackedFilename, anomalyScore, status, waitUs / 1000.0);
 			}
 			else if (prevType == InferenceType::CLASSIFICATION) {
 				float confidence = -1.0f;
@@ -470,8 +452,8 @@ void controlPointThreadFunc(int i)
 				}
 
 				// Print the result alongside the exact filename that generated it
-				LOG(">> CP {} | FILE: {} | PRED_CLASS: {} | CONFIDENCE: {}\n",
-					i, lastSentFilename, class_id, confidence);
+				LOG(">> CP {} | FILE: {} | PRED_CLASS: {} | CONFIDENCE: {} | ACK WAIT: {:.3f} ms\n",
+					i, ackedFilename, class_id, confidence, waitUs / 1000.0);
 			}
 		}
 		else if (prevState == InferenceState::ERROR_DETECTED) {
@@ -484,8 +466,11 @@ void controlPointThreadFunc(int i)
 	if (pResImage) UnmapViewOfFile(pResImage);
 	if (hMMFResImage) CloseHandle(hMMFResImage);
 
-	LOG("Thread {} stopped! (frames sent: {}, frame drops: {}, missed ticks: {})\n",
-		i, g_framesSent[i].load(), g_frameDropCount[i].load(), g_missedTicks[i].load());
+	if (stats.acksReceived == 0) stats.minWaitUs = 0;
+	g_stats[i] = stats;   // la join in wmain sincronizza la lettura
+
+	LOG("Thread {} stopped! (frames sent: {}, acks received: {})\n",
+		i, stats.framesSent, stats.acksReceived);
 }
 
 void Quit() {
@@ -737,12 +722,6 @@ bool parseInferenceType(std::wstring value, InferenceType& outType)
 
 int wmain(int argc, wchar_t* argv[])
 {
-	// Alza la risoluzione del timer di sistema a 1 ms per TUTTA la durata del
-	// processo. Senza questo, il tick di sistema (~15,6 ms) quantizza
-	// sleep_until: gli intervalli sotto ~16 ms sono impossibili da temporizzare
-	// e i 20 ms oscillano tra 1 e 2 tick, causando frame drop.
-	timeBeginPeriod(1);
-
 	// Il processo ONNX gira in REALTIME_PRIORITY_CLASS con thread in spin:
 	// senza alzare anche la nostra classe, il thread trigger viene starvato e
 	// ogni risveglio in ritardo diventa un falso frame drop. HIGH (non
@@ -755,7 +734,7 @@ int wmain(int argc, wchar_t* argv[])
 	LOG("DELTA VISIONE - Test AI via MMF + ONNX!\n");
 
 	// Optional positional arguments; defaults defined at the top of the file
-	// Usage: ConsoleApplicationTestAI.exe [inputFolder] [modelPath] [anomaly|classification|object_detection] [frameRateMs] [triggerCore]
+	// Usage: ConsoleApplicationTestAI.exe [inputFolder] [modelPath] [anomaly|classification|object_detection] [triggerCore]
 	// triggerCore: logical core (0-based) where the trigger thread is pinned.
 	// Pick a core OUTSIDE the ONNX slice (see the ONNX startup log); -1 = no pin.
 	if (argc > 1) {
@@ -766,7 +745,6 @@ int wmain(int argc, wchar_t* argv[])
 		if (g_modelPath.length() >= 512) {
 			LOGE("### ERROR: model path exceeds 511 characters.\n");
 			logger().stop();
-			timeEndPeriod(1);
 			return 1;
 		}
 	}
@@ -775,37 +753,22 @@ int wmain(int argc, wchar_t* argv[])
 			LOGE("### ERROR: unknown analysis type '{}'. Valid values: anomaly (0), classification (1), object_detection (2).\n",
 				ToNarrow(argv[3]));
 			logger().stop();
-			timeEndPeriod(1);
 			return 1;
 		}
 	}
 
 	if (argc > 4) {
 		try {
-			frameRate_milliseconds = std::stoi(argv[4]);
-		}
-		catch (const std::exception&) {
-			LOGE("### ERROR: invalid frame rate value: '{}'. Must be an integer.\n", ToNarrow(argv[4]));
-			logger().stop();
-			timeEndPeriod(1);
-			return 1;
-		}
-	}
-
-	if (argc > 5) {
-		try {
-			g_triggerCore = std::stoi(argv[5]);
+			g_triggerCore = std::stoi(argv[4]);
 			if (g_triggerCore > 63) {
 				LOGE("### ERROR: trigger core must be < 64.\n");
 				logger().stop();
-				timeEndPeriod(1);
 				return 1;
 			}
 		}
 		catch (const std::exception&) {
-			LOGE("### ERROR: invalid trigger core value: '{}'. Must be an integer (-1 = no pin).\n", ToNarrow(argv[5]));
+			LOGE("### ERROR: invalid trigger core value: '{}'. Must be an integer (-1 = no pin).\n", ToNarrow(argv[4]));
 			logger().stop();
-			timeEndPeriod(1);
 			return 1;
 		}
 	}
@@ -820,13 +783,12 @@ int wmain(int argc, wchar_t* argv[])
 	LOG(">> Input folder : {}\n"
 		">> Model path   : {}\n"
 		">> Analysis type: {}\n"
-		">> Trigger rate : {} ms\n"
+		">> Trigger mode : continuous (send next frame on ACK)\n"
 		">> Trigger core : {}\n\n",
 		g_inputFolder.string(),
 		ToNarrow(g_modelPath),
 		g_inferenceType == InferenceType::ANOMALY ? "ANOMALY" :
 		g_inferenceType == InferenceType::CLASSIFICATION ? "CLASSIFICATION" : "OBJECT_DETECTION",
-		frameRate_milliseconds,
 		g_triggerCore >= 0 ? std::to_string(g_triggerCore) : "not pinned");
 
 	srand(1792);
@@ -855,7 +817,6 @@ int wmain(int argc, wchar_t* argv[])
 		LOGE("Could not map view of file ({}).\n", GetLastError());
 		CloseHandle(hcpListMMF);
 		logger().stop();
-		timeEndPeriod(1);
 		return 1;
 	}
 
@@ -937,31 +898,25 @@ int wmain(int argc, wchar_t* argv[])
 	CloseHandle(hListEventTrigger);
 	CloseHandle(hListEventAck);
 
-	// FINAL RUN SUMMARY
-	unsigned long totalDrops = 0;
-	unsigned long totalSent = 0;
-	LOG("\n============ RUN SUMMARY ============\n");
+	// FINAL RUN SUMMARY: tempo di attesa dell'ack (trigger -> risultati pronti)
+	LOG("\n================= RUN SUMMARY =================\n");
 	for (int i = 0; i < NUM_CONTROL_POINTS; i++) {
-		const unsigned long drops = g_frameDropCount[i].load();
-		const unsigned long sent = g_framesSent[i].load();
-		totalDrops += drops;
-		totalSent += sent;
-		// frame drops  = AI ancora PENDING a un tick puntuale (colpa dell'AI)
-		// missed ticks = risveglio del simulatore in ritardo >= 1 intervallo (colpa nostra)
-		LOG("CP {} | frames sent: {:6} | frame drops: {} | missed ticks (sim late): {} | max wake lateness: {:.2f} ms\n",
-			i, sent, drops, g_missedTicks[i].load(),
-			g_maxWakeLateUs[i].load() / 1000.0);
+		const WaitStats& s = g_stats[i];
+		const double avgMs = s.acksReceived > 0
+			? (s.totalWaitUs / 1000.0) / s.acksReceived : 0.0;
+		LOG("CP {} | frames sent: {:6} | acks: {:6} | ack wait min: {:.3f} ms | avg: {:.3f} ms | max: {:.3f} ms\n",
+			i, s.framesSent, s.acksReceived,
+			s.minWaitUs / 1000.0, avgMs, s.maxWaitUs / 1000.0);
+		if (avgMs > 0.0) {
+			LOGC(fmt::color::green, /*stderr*/ false,
+				"CP {} | sustained throughput: {:.1f} frames/s\n", i, 1000.0 / avgMs);
+		}
 	}
-	LOGC(totalDrops > 0 ? fmt::color::red : fmt::color::green, /*stderr*/ false,
-		"TOTAL FRAME DROPS: {} (out of {} frames sent)\n", totalDrops, totalSent);
-	LOG("=====================================\n");
+	LOG("===============================================\n");
 
-	// Smaltisce coda e ferma il logger PRIMA di ripristinare il timer e uscire, cosi'
-	// il summary viene effettivamente stampato prima della terminazione.
+	// Smaltisce coda e ferma il logger prima di uscire, cosi' il summary
+	// viene effettivamente stampato prima della terminazione.
 	logger().stop();
-
-	// Ripristina la risoluzione del timer di sistema.
-	timeEndPeriod(1);
 }
 
 // Per eseguire il programma: CTRL+F5 oppure Debug > Avvia senza eseguire debug
