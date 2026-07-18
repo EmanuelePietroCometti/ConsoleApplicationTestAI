@@ -113,7 +113,7 @@
       <AdditionalDependencies>opencv_world4120d.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /y /d "D:\emanuele\SDK\opencv\build\x64\vc16\bin\opencv_world4120*.dll" "$(OutDir)"</Command>
+      <Command>xcopy /y /d $(ProjectDir)SDK\opencv\build\x64\vc16\bin\opencv_world4120*.dll "$(OutDir)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -135,7 +135,7 @@
       <AdditionalDependencies>opencv_world4120.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /y /d "D:\emanuele\SDK\opencv\build\x64\vc16\bin\opencv_world4120*.dll" "$(OutDir)"</Command>
+      <Command>xcopy /y /d $(ProjectDir)SDK\opencv\build\x64\vc16\bin\opencv_world4120*.dll "$(OutDir)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
