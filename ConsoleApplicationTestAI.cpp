@@ -959,6 +959,7 @@ int wmain(int argc, wchar_t* argv[])
 
 	bool isRunning = true;
 	bool isConfigured = false;
+	bool errorDetected = false;
 	while (isRunning)
 	{
 		if (_kbhit())
@@ -974,6 +975,7 @@ int wmain(int argc, wchar_t* argv[])
 				}
 				if (!isConfigured) {
 					LOGE("### ERROR: Configuration failed...starting shutdown!\n");
+					errorDetected = true;
 					Quit();
 				}
 				break;
@@ -1019,40 +1021,69 @@ int wmain(int argc, wchar_t* argv[])
 		}
 	}
 
+	for (auto& t : threads) {
+		if (t.joinable()) {
+			t.join();
+		}
+	}
+	threads.clear();
+
 	for (size_t i = 0; i < num_control_points; i++)
 	{
-		if (threads[i].joinable()) {
-			threads[i].join();
+		if (hControlPointMutex[i] != NULL && hControlPointMutex[i] != INVALID_HANDLE_VALUE) {
+			CloseHandle(hControlPointMutex[i]);
+			hControlPointMutex[i] = NULL;
 		}
-		CloseHandle(hControlPointMutex[i]);
-		CloseHandle(hControlPointEvent[i]);
-		CloseHandle(hControlPointResults[i]);
+
+		if (hControlPointEvent[i] != NULL && hControlPointEvent[i] != INVALID_HANDLE_VALUE) {
+			CloseHandle(hControlPointEvent[i]);
+			hControlPointEvent[i] = NULL;
+		}
+
+		if (hControlPointResults[i] != NULL && hControlPointResults[i] != INVALID_HANDLE_VALUE) {
+			CloseHandle(hControlPointResults[i]);
+			hControlPointResults[i] = NULL;
+		}
 	}
 
-	CloseHandle(hListMutex);
-	CloseHandle(hListEventTrigger);
-	CloseHandle(hListEventAck);
-
-	// FINAL RUN SUMMARY
-	unsigned long totalDrops = 0;
-	unsigned long totalSent = 0;
-	LOG("\n===================== RUN SUMMARY =====================\n");
-	for (int i = 0; i < num_control_points; i++) {
-		const WaitStats& s = g_stats[i];
-		totalDrops += s.frameDrops;
-		totalSent += s.framesSent;
-		const double avgMs = s.acksReceived > 0
-			? (s.totalWaitUs / 1000.0) / s.acksReceived : 0.0;
-		// frame drops  = inferenza ancora PENDING al tick (colpa dell'AI)
-		// missed ticks = risveglio del simulatore in ritardo >= 1 intervallo (colpa nostra)
-		LOG("CP {} | frames sent: {:6} | results: {:6} | frame drops: {} | missed ticks (sim late): {}\n"
-			"CP {} | ack wait (trigger -> RESULT_READY) min: {:.3f} ms | avg: {:.3f} ms | max: {:.3f} ms\n",
-			i, s.framesSent, s.acksReceived, s.frameDrops, s.missedTicks,
-			i, s.minWaitUs / 1000.0, avgMs, s.maxWaitUs / 1000.0);
+	if (hListMutex != NULL && hListMutex != INVALID_HANDLE_VALUE) {
+		CloseHandle(hListMutex);
+		hListMutex = NULL;
 	}
-	LOGC(totalDrops > 0 ? fmt::color::red : fmt::color::green, /*stderr*/ false,
-		"TOTAL FRAME DROPS: {} (out of {} frames sent)\n", totalDrops, totalSent);
-	LOG("=======================================================\n");
+
+	if (hListEventTrigger != NULL && hListEventTrigger != INVALID_HANDLE_VALUE) {
+		CloseHandle(hListEventTrigger);
+		hListEventTrigger = NULL;
+	}
+
+	if (hListEventAck != NULL && hListEventAck != INVALID_HANDLE_VALUE) {
+		CloseHandle(hListEventAck);
+		hListEventAck = NULL;
+	}
+
+
+	if (!errorDetected) {
+		// FINAL RUN SUMMARY
+		unsigned long totalDrops = 0;
+		unsigned long totalSent = 0;
+		LOG("\n===================== RUN SUMMARY =====================\n");
+		for (int i = 0; i < num_control_points; i++) {
+			const WaitStats& s = g_stats[i];
+			totalDrops += s.frameDrops;
+			totalSent += s.framesSent;
+			const double avgMs = s.acksReceived > 0
+				? (s.totalWaitUs / 1000.0) / s.acksReceived : 0.0;
+			// frame drops  = inferenza ancora PENDING al tick (colpa dell'AI)
+			// missed ticks = risveglio del simulatore in ritardo >= 1 intervallo (colpa nostra)
+			LOG("CP {} | frames sent: {:6} | results: {:6} | frame drops: {} | missed ticks (sim late): {}\n"
+				"CP {} | ack wait (trigger -> RESULT_READY) min: {:.3f} ms | avg: {:.3f} ms | max: {:.3f} ms\n",
+				i, s.framesSent, s.acksReceived, s.frameDrops, s.missedTicks,
+				i, s.minWaitUs / 1000.0, avgMs, s.maxWaitUs / 1000.0);
+		}
+		LOGC(totalDrops > 0 ? fmt::color::red : fmt::color::green, /*stderr*/ false,
+			"TOTAL FRAME DROPS: {} (out of {} frames sent)\n", totalDrops, totalSent);
+		LOG("=======================================================\n");
+	}
 
 	// Smaltisce coda e ferma il logger PRIMA di ripristinare il timer e uscire,
 	// cosi' il summary viene effettivamente stampato prima della terminazione.
