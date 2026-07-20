@@ -23,7 +23,10 @@
 
 #pragma comment(lib, "winmm.lib")   // timeBeginPeriod / timeEndPeriod
 
-int num_control_points; // numero di control points da simulare
+// Default 1: da variabile globale non inizializzata valeva 0, quindi senza il
+// 7° argomento 'c' configurava zero punti e 's' non avviava alcun thread,
+// facendo sembrare il programma bloccato.
+int num_control_points = 1; // numero di control points da simulare
 
 enum class InferenceState : WORD {
 	IDLE = 0,
@@ -168,6 +171,26 @@ static AsyncLogger& logger() {
 	return inst;
 }
 
+// fmt emette i colori come sequenze ANSI (\x1b[38;2;...m): il conhost classico
+// non le interpreta finche' non si attiva ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+// e le stampa letteralmente come "<-[38;2;...m". Se l'attivazione fallisce
+// (console troppo vecchia) i colori vengono semplicemente disabilitati.
+static bool g_ansiColorSupported = false;
+
+static void EnableVTProcessing() {
+	g_ansiColorSupported = true;
+	for (DWORD stdHandle : { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) {
+		HANDLE h = GetStdHandle(stdHandle);
+		DWORD mode = 0;
+		if (h == NULL || h == INVALID_HANDLE_VALUE || !GetConsoleMode(h, &mode)) {
+			continue;   // stream redirezionato su file/pipe: non e' una console
+		}
+		if (!SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+			g_ansiColorSupported = false;
+		}
+	}
+}
+
 // Helper: formattano il messaggio e lo accodano. Sostituiscono fmt::print.
 template <typename... Args>
 static void LOG(fmt::format_string<Args...> f, Args&&... a) {
@@ -179,7 +202,8 @@ static void LOGE(fmt::format_string<Args...> f, Args&&... a) {
 }
 template <typename... Args>
 static void LOGC(fmt::color c, bool toStderr, fmt::format_string<Args...> f, Args&&... a) {
-	logger().log(fmt::format(f, std::forward<Args>(a)...), toStderr, c);
+	logger().log(fmt::format(f, std::forward<Args>(a)...), toStderr,
+		g_ansiColorSupported ? std::optional<fmt::color>(c) : std::nullopt);
 }
 
 // Runtime configuration (overridable via command line, see wmain)
@@ -786,6 +810,21 @@ bool isQuitRequested()
 	return quit;
 }
 
+// QuickEdit (conhost): un click nella finestra entra in modalita' selezione e
+// congela le scritture su console; i tasti vanno alla selezione, non a _getch.
+// Il processo sembra "bloccato" finche' non si preme ESC/Invio. Disattivarlo
+// rende il freeze impossibile. ENABLE_EXTENDED_FLAGS e' obbligatorio, senza
+// di esso la modifica a QUICK_EDIT viene ignorata.
+static void DisableQuickEditMode() {
+	HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+	if (hIn == NULL || hIn == INVALID_HANDLE_VALUE) return;
+	DWORD mode = 0;
+	if (!GetConsoleMode(hIn, &mode)) return;   // stdin non e' una console
+	mode &= ~ENABLE_QUICK_EDIT_MODE;
+	mode |= ENABLE_EXTENDED_FLAGS;
+	SetConsoleMode(hIn, mode);
+}
+
 // Parse the analysis type argument: accepts the enum name (case-insensitive) or its numeric value
 bool parseInferenceType(std::wstring value, InferenceType& outType)
 {
@@ -808,6 +847,11 @@ bool parseInferenceType(std::wstring value, InferenceType& outType)
 
 int wmain(int argc, wchar_t* argv[])
 {
+	// Va fatto PRIMA di qualunque stampa: elimina i freeze da click accidentale
+	// e attiva l'interpretazione delle sequenze ANSI dei colori.
+	DisableQuickEditMode();
+	EnableVTProcessing();
+
 	// Alza la risoluzione del timer di sistema a 1 ms per TUTTA la durata del
 	// processo: migliora la granularita' sia degli sleep sia dei timeout di
 	// WaitForSingleObject usati per attendere il tick del frame grabber.
@@ -917,13 +961,15 @@ int wmain(int argc, wchar_t* argv[])
 		">> Model path   : {}\n"
 		">> Analysis type: {}\n"
 		">> Trigger rate : {} ms\n"
-		">> Trigger core : {}\n\n",
+		">> Trigger core : {}\n"
+		">> Control pts  : {}\n\n",
 		g_inputFolder.string(),
 		ToNarrow(g_modelPath),
 		g_inferenceType == InferenceType::ANOMALY ? "ANOMALY" :
 		g_inferenceType == InferenceType::CLASSIFICATION ? "CLASSIFICATION" : "OBJECT_DETECTION",
 		frameRate_milliseconds,
-		g_triggerCore >= 0 ? std::to_string(g_triggerCore) : "not pinned");
+		g_triggerCore >= 0 ? std::to_string(g_triggerCore) : "not pinned",
+		num_control_points);
 
 	srand(1792);
 
