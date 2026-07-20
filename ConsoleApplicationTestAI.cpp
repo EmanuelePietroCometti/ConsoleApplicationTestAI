@@ -233,7 +233,7 @@ struct WaitStats {
 	unsigned long acksReceived = 0; // risultati validi ricevuti (attese misurate)
 	unsigned long frameDrops = 0;   // tick con inferenza ancora PENDING
 	unsigned long missedTicks = 0;  // risvegli del simulatore in ritardo >= 1 intervallo
-	long long totalWaitUs = 0;
+	long long avgWaitUs = 0;
 	long long minWaitUs = 0;
 	long long maxWaitUs = 0;
 };
@@ -362,7 +362,7 @@ void controlPointThreadFunc(int i)
 		if (prevState == InferenceState::RESULT_READY) {
 
 			stats.acksReceived++;
-			stats.totalWaitUs += waitUs;
+			stats.avgWaitUs = ((((long long)stats.acksReceived) - 1)*waitUs)/((long long)stats.acksReceived);
 			if (waitUs < stats.minWaitUs) stats.minWaitUs = waitUs;
 			if (waitUs > stats.maxWaitUs) stats.maxWaitUs = waitUs;
 
@@ -1117,14 +1117,12 @@ int wmain(int argc, wchar_t* argv[])
 			const WaitStats& s = g_stats[i];
 			totalDrops += s.frameDrops;
 			totalSent += s.framesSent;
-			const double avgMs = s.acksReceived > 0
-				? (s.totalWaitUs / 1000.0) / s.acksReceived : 0.0;
 			// frame drops  = inferenza ancora PENDING al tick (colpa dell'AI)
 			// missed ticks = risveglio del simulatore in ritardo >= 1 intervallo (colpa nostra)
 			LOG("CP {} | frames sent: {:6} | results: {:6} | frame drops: {} | missed ticks (sim late): {}\n"
 				"CP {} | ack wait (trigger -> RESULT_READY) min: {:.3f} ms | avg: {:.3f} ms | max: {:.3f} ms\n",
 				i, s.framesSent, s.acksReceived, s.frameDrops, s.missedTicks,
-				i, s.minWaitUs / 1000.0, avgMs, s.maxWaitUs / 1000.0);
+				i, s.minWaitUs / 1000.0, s.avgWaitUs / 1000.0, s.maxWaitUs / 1000.0);
 		}
 		LOGC(totalDrops > 0 ? fmt::color::red : fmt::color::green, /*stderr*/ false,
 			"TOTAL FRAME DROPS: {} (out of {} frames sent)\n", totalDrops, totalSent);
