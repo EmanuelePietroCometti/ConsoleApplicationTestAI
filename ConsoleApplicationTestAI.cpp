@@ -20,6 +20,9 @@
 #include <climits>
 #include <fmt/core.h>
 #include <fmt/color.h>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
 
 #pragma comment(lib, "winmm.lib")   // timeBeginPeriod / timeEndPeriod
 
@@ -366,71 +369,61 @@ void controlPointThreadFunc(int i)
 			if (waitUs < stats.minWaitUs) stats.minWaitUs = waitUs;
 			if (waitUs > stats.maxWaitUs) stats.maxWaitUs = waitUs;
 
-			// The JSON payload is plain ASCII: convert it once and parse narrow
+			// The JSON payload is plain ASCII: convert once and parse narrow
 			const wchar_t* p = jsonCopy;
 			std::string jsonStr;
 			jsonStr.reserve(wcsnlen(p, 1024));
 			for (size_t k = 0; k < 1024 && p[k]; ++k)
-				jsonStr.push_back(static_cast<char>(p[k]));  // cast esplicito -> niente C4244
+				jsonStr.push_back(static_cast<char>(p[k]));
 
-			if (prevType == InferenceType::ANOMALY) {
-				float anomalyScore = -1.0f;
-				std::string status = "UNKNOWN";
-
-				// nlohmann/json emits compact JSON: {"anomaly_score":0.123,"status":"OK"}
-				const std::string scoreKey = "\"anomaly_score\":";
-				size_t scorePos = jsonStr.find(scoreKey);
-				if (scorePos != std::string::npos) {
-					try { anomalyScore = std::stof(jsonStr.substr(scorePos + scoreKey.length())); }
-					catch (const std::exception& e) {
-						LOGE("Exception occurred: {}\n", e.what());
-					}
-				}
-
-				const std::string statusKey = "\"status\":\"";
-				size_t statusPos = jsonStr.find(statusKey);
-				if (statusPos != std::string::npos) {
-					size_t valStart = statusPos + statusKey.length();
-					size_t valEnd = jsonStr.find('"', valStart);
-					if (valEnd != std::string::npos) {
-						status = jsonStr.substr(valStart, valEnd - valStart);
-					}
-				}
-
-				LOG(">> CP {} | FILE: {} | ANOMALY_SCORE: {} | STATUS: {} | ACK WAIT: {:.3f} ms\n",
-					i, ackedFilename, anomalyScore, status, waitUs / 1000.0);
+			if (jsonStr.empty()) {
+				LOGE("CP {} | FILE: {} | RESULT_READY but empty JSON payload\n", i, ackedFilename);
+				return;
 			}
-			else if (prevType == InferenceType::CLASSIFICATION) {
-				float confidence = -1.0f;
-				int class_id = -1;
 
-				const std::string confKey = "\"confidence\":";
-				size_t confPos = jsonStr.find(confKey);
-				if (confPos != std::string::npos) {
-					try { confidence = std::stof(jsonStr.substr(confPos + confKey.length())); }
-					catch (const std::exception& e) {
-						LOGE("Exception occurred: {}\n", e.what());
-					}
+			// One try around ALL access to j: parse_error, type_error and out_of_range
+			// all derive from json::exception. Without this, a type_error would escape
+			// the thread and terminate the process.
+			try {
+				const json j = json::parse(jsonStr);
+
+				if (!j.is_object()) {
+					LOGE("CP {} | FILE: {} | JSON is not an object: {}\n", i, ackedFilename, jsonStr);
+					return;
 				}
 
-				const std::string classKey = "\"class_id\":";
-				size_t classPos = jsonStr.find(classKey);
-				if (classPos != std::string::npos) {
-					try { class_id = std::stoi(jsonStr.substr(classPos + classKey.length())); }
-					catch (const std::exception& e) {
-						LOGE("Exception occurred: {}\n", e.what());
-					}
-				}
+				if (prevType == InferenceType::ANOMALY) {
+					const float anomalyScore = j.value("anomaly_score", -1.0f);
+					const std::string status = j.value("status", std::string("UNKNOWN"));
 
-				// Print the result alongside the exact filename that generated it
-				LOG(">> CP {} | FILE: {} | PRED_CLASS: {} | CONFIDENCE: {} | ACK WAIT: {:.3f} ms\n",
-					i, ackedFilename, class_id, confidence, waitUs / 1000.0);
+					LOG(">> CP {} | FILE: {} | ANOMALY_SCORE: {:.6f} | STATUS: {} | ACK WAIT: {:.3f} ms\n",
+						i, ackedFilename, anomalyScore, status, waitUs / 1000.0);
+				}
+				else if (prevType == InferenceType::CLASSIFICATION) {
+					const float confidence = j.value("confidence", -1.0f);
+
+					// class_id is a label string ("1_BadPins"); accept a numeric value
+					// too, in case the producer ever switches to a plain index.
+					std::string class_id = "UNKNOWN";
+					if (const auto it = j.find("class_id"); it != j.end()) {
+						class_id = it->is_string() ? it->get<std::string>() : it->dump();
+					}
+
+					LOG(">> CP {} | FILE: {} | CLASS_ID: {} | CONFIDENCE: {:.6f} | ACK WAIT: {:.3f} ms\n",
+						i, ackedFilename, class_id, confidence, waitUs / 1000.0);
+				}
+				else {
+					// OBJECT_DETECTION or unhandled type: raw dump is better than nothing
+					LOG(">> CP {} | FILE: {} | RAW: {} | ACK WAIT: {:.3f} ms\n",
+						i, ackedFilename, jsonStr, waitUs / 1000.0);
+				}
+			}
+			catch (const json::exception& e) {
+				LOGE("CP {} | FILE: {} | JSON error ({}): {} | payload: {}\n",
+					i, ackedFilename, e.id, e.what(), jsonStr);
 			}
 		}
-		else if (prevState == InferenceState::ERROR_DETECTED) {
-			LOGE("### POINT {} AI ERROR DETECTED!\n", i);
-		}
-		};
+	};
 
 	// FRAME GRABBER SIMULATO: trigger a intervallo fisso (default 50 ms), come
 	// una telecamera reale. Tra un tick e l'altro il thread resta in ascolto
