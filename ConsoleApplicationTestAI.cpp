@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <climits>
+#include <stdexcept>
 #include <fmt/core.h>
 #include <fmt/color.h>
 #include <nlohmann/json.hpp>
@@ -26,10 +27,9 @@ using json = nlohmann::json;
 
 #pragma comment(lib, "winmm.lib")   // timeBeginPeriod / timeEndPeriod
 
-// Default 1: da variabile globale non inizializzata valeva 0, quindi senza il
-// 7° argomento 'c' configurava zero punti e 's' non avviava alcun thread,
-// facendo sembrare il programma bloccato.
-int num_control_points = 1; // numero di control points da simulare
+// Defaulting to 1 prevents the edge case where an uninitialized global variable 
+// causes zero control points to be configured, which would result in frozen threads.
+int num_control_points = 1; // Number of control points to simulate
 
 enum class InferenceState : WORD {
 	IDLE = 0,
@@ -99,13 +99,12 @@ struct ScopedMutex {
 
 // ============================================================================
 //  ASYNC LOGGER
-//  Tutto l'output su console passa da un unico thread consumatore. Il percorso
-//  caldo (thread frame-grabber) fa solo fmt::format + push in coda sotto un
-//  mutex tenuto per pochi microsecondi: NESSUNA scrittura su console nel loop
-//  temporizzato. Questo elimina:
-//    - il blocco da console-lock globale di Windows dentro la sezione temporizzata
-//    - il feedback loop "piu' drop -> piu' stampe -> piu' jitter -> piu' drop"
-//  Un solo writer garantisce inoltre righe non interlacciate tra thread.
+//  All console output is routed through a single consumer thread. 
+//  The hot path (frame-grabber thread) only performs fmt::format and queues 
+//  the result under a briefly held mutex, avoiding any console I/O within the timed loop. 
+//  This prevents Windows global console-lock blocking and stops the 
+//  "more drops -> more prints -> more jitter" feedback loop.
+//  A single writer also guarantees that output lines from different threads are not interleaved.
 // ============================================================================
 class AsyncLogger {
 public:
@@ -126,8 +125,18 @@ public:
 			cv_.notify_one();
 	}
 
-	// Svuota la coda e ferma il worker. Idempotente: la seconda chiamata
-	// (es. dal distruttore statico) esce subito.
+	// Blocks the caller until all pending output is written and flushed. 
+	// Required before any synchronous console write (interactive prompts) to prevent 
+	// logger lines from interleaving with prompts. Only safe to use outside timed paths.
+	void flush() {
+		std::unique_lock<std::mutex> lk(mtx_);
+		if (queue_.empty() && !writing_) return;
+		cv_.notify_one();
+		flushed_.wait(lk, [&] { return queue_.empty() && !writing_; });
+	}
+
+	// Flushes the queue and stops the worker. Idempotent: subsequent calls 
+	// (e.g., from the static destructor) exit immediately.
 	void stop() {
 		if (!running_.exchange(false)) return;
 		cv_.notify_one();
@@ -142,7 +151,8 @@ private:
 	};
 
 	void run() {
-		// Il logger non deve mai competere con il thread trigger per la CPU.
+		// The logger thread priority is lowered to ensure it never competes 
+		// with the trigger thread for CPU resources.
 		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 		std::unique_lock<std::mutex> lk(mtx_);
 		for (;;) {
@@ -150,34 +160,41 @@ private:
 			while (!queue_.empty()) {
 				Entry e = std::move(queue_.front());
 				queue_.pop_front();
+				writing_ = true;
 				lk.unlock();
 				FILE* out = e.toStderr ? stderr : stdout;
 				if (e.color) fmt::print(out, fg(*e.color), "{}", e.text);
 				else         fmt::print(out, "{}", e.text);
+				// stderr is unbuffered, stdout is buffered: without flushing, 
+				// a LOGE could overtake a previously queued LOG.
+				fflush(out);
 				lk.lock();
+				writing_ = false;
 			}
-			if (!running_.load()) break;   // coda vuota e in fase di stop
+			flushed_.notify_all();
+			if (!running_.load()) break;   // Queue empty and stopping
 		}
 	}
 
 	std::mutex mtx_;
 	std::condition_variable cv_;
+	std::condition_variable flushed_;   // Signaled when the queue is emptied and flushed
+	bool writing_ = false;              // Worker is outside the lock, currently printing
 	std::deque<Entry> queue_;
 	std::thread worker_;
 	std::atomic<bool> running_;
 };
 
-// Meyers singleton: costruito alla prima chiamata (dentro wmain), distrutto
-// all'uscita del processo. Evita problemi di ordine di init statico.
+// Meyers singleton: instantiated on the first call (inside wmain) and destroyed 
+// on process exit. Prevents static initialization order issues.
 static AsyncLogger& logger() {
 	static AsyncLogger inst;
 	return inst;
 }
 
-// fmt emette i colori come sequenze ANSI (\x1b[38;2;...m): il conhost classico
-// non le interpreta finche' non si attiva ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-// e le stampa letteralmente come "<-[38;2;...m". Se l'attivazione fallisce
-// (console troppo vecchia) i colori vengono semplicemente disabilitati.
+// fmt outputs colors as ANSI sequences. Standard conhost does not interpret them 
+// unless ENABLE_VIRTUAL_TERMINAL_PROCESSING is active. If activation fails 
+// (legacy console), colors are simply disabled.
 static bool g_ansiColorSupported = false;
 
 static void EnableVTProcessing() {
@@ -186,7 +203,7 @@ static void EnableVTProcessing() {
 		HANDLE h = GetStdHandle(stdHandle);
 		DWORD mode = 0;
 		if (h == NULL || h == INVALID_HANDLE_VALUE || !GetConsoleMode(h, &mode)) {
-			continue;   // stream redirezionato su file/pipe: non e' una console
+			continue;   // Stream redirected to file/pipe: not a console
 		}
 		if (!SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
 			g_ansiColorSupported = false;
@@ -194,7 +211,7 @@ static void EnableVTProcessing() {
 	}
 }
 
-// Helper: formattano il messaggio e lo accodano. Sostituiscono fmt::print.
+// Helpers format the message and push it to the logger queue, replacing fmt::print.
 template <typename... Args>
 static void LOG(fmt::format_string<Args...> f, Args&&... a) {
 	logger().log(fmt::format(f, std::forward<Args>(a)...), /*stderr*/ false);
@@ -209,10 +226,6 @@ static void LOGC(fmt::color c, bool toStderr, fmt::format_string<Args...> f, Arg
 		g_ansiColorSupported ? std::optional<fmt::color>(c) : std::nullopt);
 }
 
-// Runtime configuration (overridable via command line, see wmain)
-std::filesystem::path g_inputFolder = L"D:\\emanuele\\Code\\ConsoleApplicationTestAI\\dataset";
-std::wstring g_modelPath = L"D:\\emanuele\\Code\\ConsoleApplicationTestAI\\model\\yolo_pure.onnx";
-InferenceType g_inferenceType = InferenceType::CLASSIFICATION;
 
 HANDLE hcpListMMF = NULL;
 PTcontrolPointsList cpListMMF = NULL;
@@ -225,17 +238,34 @@ std::vector<HANDLE> hControlPointResults;
 HANDLE hListMutex = NULL;
 HANDLE hListEventTrigger = NULL;
 HANDLE hListEventAck = NULL;
-int frameRate_milliseconds = 50;   // intervallo del frame grabber simulato
-int g_triggerCore = -1;   // logical core for the trigger thread (-1 = no pinning)
+int frameRate_milliseconds = 50;   // Simulated frame grabber interval
+int g_triggerCore = -1;   // Logical core for the trigger thread (-1 = no pinning)
 
-// Statistiche per control point. Il tempo di attesa dell'ack (trigger ->
-// RESULT_READY) e' misurato solo sui risultati validi. Scritte dal thread del
-// control point prima di terminare, lette dal main dopo la join.
+// ============================================================================
+//  CONTROL POINT CONFIGURATION
+//  Each control point maintains its own model, dataset, geometry, and analysis type.
+//  These replace the former global variables and are indexed matching cpListMMF->points[].
+//  Populated via keyboard input in Configure() before Start() spins up the threads,
+//  allowing thread-safe read-only access without synchronization.
+// ============================================================================
+struct ControlPointConfig {
+	std::filesystem::path inputFolder;   // Control point dataset folder
+	std::wstring          modelPath;     // Control point .onnx model path
+	InferenceType         inferenceType = InferenceType::ANOMALY;
+	int                   sizeX = 0;
+	int                   sizeY = 0;
+	int                   bpp = 0;
+};
+std::vector<ControlPointConfig> g_cpConfigs;
+
+// Control point statistics. The ACK wait time (trigger -> RESULT_READY) is measured 
+// exclusively for valid results. Written by the control point thread before 
+// termination and read by the main thread post-join.
 struct WaitStats {
-	unsigned long framesSent = 0;   // frame inviati (trigger emessi)
-	unsigned long acksReceived = 0; // risultati validi ricevuti (attese misurate)
-	unsigned long frameDrops = 0;   // tick con inferenza ancora PENDING
-	unsigned long missedTicks = 0;  // risvegli del simulatore in ritardo >= 1 intervallo
+	unsigned long framesSent = 0;   // Frames sent (triggers emitted)
+	unsigned long acksReceived = 0; // Valid results received (measured waits)
+	unsigned long frameDrops = 0;   // Ticks where inference is still PENDING
+	unsigned long missedTicks = 0;  // Simulator wakeups delayed by >= 1 interval
 	long long avgWaitUs = 0;
 	long long minWaitUs = 0;
 	long long maxWaitUs = 0;
@@ -250,11 +280,10 @@ static std::string ToNarrow(const std::wstring& wide) {
 
 void controlPointThreadFunc(int i)
 {
-	// Il processo ONNX gira in REALTIME con thread TIME_CRITICAL in spin sui
-	// core del suo slice: il produttore deve avere priorita' massima nella
-	// propria classe e, se richiesto, essere pinnato su un core FUORI dallo
-	// slice ONNX, altrimenti viene starvato e i risvegli in ritardo si
-	// trasformano in falsi frame drop.
+	// The ONNX process runs in REALTIME with TIME_CRITICAL threads spinning on its 
+	// allocated slice. The producer thread must be given maximum priority within its 
+	// class and, if specified, pinned to a core OUTSIDE the ONNX slice to prevent 
+	// starvation and false frame drops.
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 	if (g_triggerCore >= 0) {
 		if (SetThreadAffinityMask(GetCurrentThread(), 1ULL << g_triggerCore) == 0) {
@@ -264,6 +293,9 @@ void controlPointThreadFunc(int i)
 			LOG("Trigger thread {} pinned to logical core {}\n", i, g_triggerCore);
 		}
 	}
+
+	// Read-only configuration specific to this control point.
+	const ControlPointConfig& cfg = g_cpConfigs[i];
 
 	// Map INPUT IMAGE (Sender -> AI)
 	int nPayload = cpListMMF->points[i].sizeX * cpListMMF->points[i].sizeY * cpListMMF->points[i].bpp / 8;
@@ -285,16 +317,14 @@ void controlPointThreadFunc(int i)
 		pResImage = MapViewOfFile(hMMFResImage, FILE_MAP_READ, 0, 0, nResPayload);
 	}
 
-	// PRELOAD: decodifica + resize di TUTTE le immagini una volta sola, PRIMA
-	// del loop temporizzato. La versione precedente collezionava solo i path e
-	// faceva imread+resize a ogni ciclo: quando il decode sforava il tempo
-	// morto tra due tick, il thread arrivava in ritardo e produceva raffiche
-	// di falsi drop. Cosi' nel loop resta solo un memcpy (~0.1 ms a frame).
+	// PRELOAD: Decodes and resizes ALL images once, PRIOR to the timed loop. 
+	// Moving imread and resize out of the cycle prevents decoding delays from 
+	// causing late wakeups and false drops. The timed loop now only performs a memcpy (~0.1 ms per frame).
 	std::vector<cv::Mat> frames;
 	std::vector<std::string> frameNames;
 
 	try {
-		for (const auto& entry : std::filesystem::recursive_directory_iterator(g_inputFolder)) {
+		for (const auto& entry : std::filesystem::recursive_directory_iterator(cfg.inputFolder)) {
 			if (entry.is_regular_file()) {
 				std::string ext = entry.path().extension().string();
 				std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -321,8 +351,13 @@ void controlPointThreadFunc(int i)
 		LOGE("### ERROR reading directory: {}\n", e.what());
 	}
 
-	LOG("Thread {} running (Simulating Frame Grabber @ {} ms). Preloaded {} frames ({} MB in RAM).\n",
-		i, frameRate_milliseconds, frames.size(), frames.size() * static_cast<size_t>(nPayload) / (1024 * 1024));
+	LOG("Thread {} running (Simulating Frame Grabber @ {} ms).\n"
+		"        model  : {}\n"
+		"        dataset: {}\n"
+		"        preloaded {} frames ({} MB in RAM).\n",
+		i, frameRate_milliseconds,
+		ToNarrow(cfg.modelPath), cfg.inputFolder.string(),
+		frames.size(), frames.size() * static_cast<size_t>(nPayload) / (1024 * 1024));
 
 	int imageIndex = 0;
 	std::string lastSentFilename = "NONE";
@@ -355,89 +390,88 @@ void controlPointThreadFunc(int i)
 		SetEvent(hControlPointEvent[i]);
 		};
 
-	// Parsing e stampa del risultato del frame: chiamato FUORI dal lock, su
-	// copie locali (la memoria condivisa puo' essere riscritta dal worker
-	// subito dopo il release). Aggiorna anche le statistiche di attesa: il
-	// timer viene conteggiato SOLO su RESULT_READY.
+	// Frame result parsing and logging. Executed OUTSIDE the lock using local copies, 
+	// since shared memory might be overwritten immediately after release. 
+	// This also updates wait stats, counting the timer strictly on RESULT_READY.
 	auto reportResult = [&](InferenceState prevState, InferenceType prevType,
 		const wchar_t* jsonCopy, const std::string& ackedFilename, long long waitUs) {
 
-		if (prevState == InferenceState::RESULT_READY) {
+			if (prevState == InferenceState::RESULT_READY) {
 
-			stats.acksReceived++;
-			stats.avgWaitUs = ((((long long)stats.acksReceived) - 1)*waitUs)/((long long)stats.acksReceived);
-			if (waitUs < stats.minWaitUs) stats.minWaitUs = waitUs;
-			if (waitUs > stats.maxWaitUs) stats.maxWaitUs = waitUs;
+				stats.acksReceived++;
+				// Incremental average: avg += (x - avg) / n. This corrects the previous 
+				// formula (((n-1)*x)/n) which mathematically tended towards x rather than an actual average.
+				stats.avgWaitUs += (waitUs - stats.avgWaitUs) / (long long)stats.acksReceived;
+				if (waitUs < stats.minWaitUs) stats.minWaitUs = waitUs;
+				if (waitUs > stats.maxWaitUs) stats.maxWaitUs = waitUs;
 
-			// The JSON payload is plain ASCII: convert once and parse narrow
-			const wchar_t* p = jsonCopy;
-			std::string jsonStr;
-			jsonStr.reserve(wcsnlen(p, 1024));
-			for (size_t k = 0; k < 1024 && p[k]; ++k)
-				jsonStr.push_back(static_cast<char>(p[k]));
+				// The JSON payload is plain ASCII: convert once and parse narrow
+				const wchar_t* p = jsonCopy;
+				std::string jsonStr;
+				jsonStr.reserve(wcsnlen(p, 1024));
+				for (size_t k = 0; k < 1024 && p[k]; ++k)
+					jsonStr.push_back(static_cast<char>(p[k]));
 
-			if (jsonStr.empty()) {
-				LOGE("CP {} | FILE: {} | RESULT_READY but empty JSON payload\n", i, ackedFilename);
-				return;
-			}
-
-			// One try around ALL access to j: parse_error, type_error and out_of_range
-			// all derive from json::exception. Without this, a type_error would escape
-			// the thread and terminate the process.
-			try {
-				const json j = json::parse(jsonStr);
-
-				if (!j.is_object()) {
-					LOGE("CP {} | FILE: {} | JSON is not an object: {}\n", i, ackedFilename, jsonStr);
+				if (jsonStr.empty()) {
+					LOGE("CP {} | FILE: {} | RESULT_READY but empty JSON payload\n", i, ackedFilename);
 					return;
 				}
 
-				if (prevType == InferenceType::ANOMALY) {
-					const float anomalyScore = j.value("anomaly_score", -1.0f);
-					const std::string status = j.value("status", std::string("UNKNOWN"));
+				// One try around ALL access to j: parse_error, type_error and out_of_range
+				// all derive from json::exception. Without this, a type_error would escape
+				// the thread and terminate the process.
+				try {
+					const json j = json::parse(jsonStr);
 
-					LOG(">> CP {} | FILE: {} | ANOMALY_SCORE: {:.6f} | STATUS: {} | ACK WAIT: {:.3f} ms\n",
-						i, ackedFilename, anomalyScore, status, waitUs / 1000.0);
-				}
-				else if (prevType == InferenceType::CLASSIFICATION) {
-					const float confidence = j.value("confidence", -1.0f);
-
-					// class_id is a label string ("1_BadPins"); accept a numeric value
-					// too, in case the producer ever switches to a plain index.
-					std::string class_id = "UNKNOWN";
-					if (const auto it = j.find("class_id"); it != j.end()) {
-						class_id = it->is_string() ? it->get<std::string>() : it->dump();
+					if (!j.is_object()) {
+						LOGE("CP {} | FILE: {} | JSON is not an object: {}\n", i, ackedFilename, jsonStr);
+						return;
 					}
 
-					LOG(">> CP {} | FILE: {} | CLASS_ID: {} | CONFIDENCE: {:.6f} | ACK WAIT: {:.3f} ms\n",
-						i, ackedFilename, class_id, confidence, waitUs / 1000.0);
-				}
-				else {
-					// OBJECT_DETECTION or unhandled type: raw dump is better than nothing
-					LOG(">> CP {} | FILE: {} | RAW: {} | ACK WAIT: {:.3f} ms\n",
-						i, ackedFilename, jsonStr, waitUs / 1000.0);
-				}
-			}
-			catch (const json::exception& e) {
-				LOGE("CP {} | FILE: {} | JSON error ({}): {} | payload: {}\n",
-					i, ackedFilename, e.id, e.what(), jsonStr);
-			}
-		}
-	};
+					if (prevType == InferenceType::ANOMALY) {
+						const float anomalyScore = j.value("anomaly_score", -1.0f);
+						const std::string status = j.value("status", std::string("UNKNOWN"));
 
-	// FRAME GRABBER SIMULATO: trigger a intervallo fisso (default 50 ms), come
-	// una telecamera reale. Tra un tick e l'altro il thread resta in ascolto
-	// dell'ack: se l'inferenza finisce prima, scarica subito la MMF e riporta
-	// lo stato a IDLE, poi attende lo scadere dell'intervallo. Al tick pusha
-	// solo se lo stato e' IDLE o RESULT_READY; se e' ancora PENDING la
-	// telecamera non puo' consegnare il frame: frame drop.
+						LOG(">> CP {} | FILE: {} | ANOMALY_SCORE: {:.6f} | STATUS: {} | ACK WAIT: {:.3f} ms\n",
+							i, ackedFilename, anomalyScore, status, waitUs / 1000.0);
+					}
+					else if (prevType == InferenceType::CLASSIFICATION) {
+						const float confidence = j.value("confidence", -1.0f);
+
+						// class_id is a label string ("1_BadPins"); accept a numeric value
+						// too, in case the producer ever switches to a plain index.
+						std::string class_id = "UNKNOWN";
+						if (const auto it = j.find("class_id"); it != j.end()) {
+							class_id = it->is_string() ? it->get<std::string>() : it->dump();
+						}
+
+						LOG(">> CP {} | FILE: {} | CLASS_ID: {} | CONFIDENCE: {:.6f} | ACK WAIT: {:.3f} ms\n",
+							i, ackedFilename, class_id, confidence, waitUs / 1000.0);
+					}
+					else {
+						// OBJECT_DETECTION or unhandled type: raw dump is better than nothing
+						LOG(">> CP {} | FILE: {} | RAW: {} | ACK WAIT: {:.3f} ms\n",
+							i, ackedFilename, jsonStr, waitUs / 1000.0);
+					}
+				}
+				catch (const json::exception& e) {
+					LOGE("CP {} | FILE: {} | JSON error ({}): {} | payload: {}\n",
+						i, ackedFilename, e.id, e.what(), jsonStr);
+				}
+			}
+		};
+
+	// SIMULATED FRAME GRABBER: Triggers at a fixed interval (default 50 ms). 
+	// Between ticks, the thread listens for the ACK. If inference finishes early, 
+	// it unloads the MMF and resets the state to IDLE, waiting for the interval to expire. 
+	// At tick time, pushes only occur if the state is IDLE or RESULT_READY; if PENDING, the frame is dropped.
 	const auto hardwareTriggerInterval = std::chrono::milliseconds(frameRate_milliseconds);
 	constexpr auto kSpinWindow = std::chrono::milliseconds(2);
 
 	std::chrono::steady_clock::time_point triggerTime;
 	bool keepRunning = true;
 
-	// Primo frame: fissa anche l'origine della griglia dei tick.
+	// First frame processing. This also anchors the origin point for the tick grid.
 	{
 		DWORD dwWaitResult = WaitForSingleObject(hControlPointMutex[i], INFINITE);
 		if (dwWaitResult == WAIT_OBJECT_0 || dwWaitResult == WAIT_ABANDONED) {
@@ -455,10 +489,9 @@ void controlPointThreadFunc(int i)
 
 	while (keepRunning)
 	{
-		// FASE 1: ascolto dell'ack fino a ridosso del prossimo tick
-		// WaitForSingleObject con timeout fa sia da sleep sia da ascolto: se
-		// l'inferenza finisce prima del tick, il risultato viene scaricato
-		// subito e lo slot torna IDLE, pronto per il push al tick.
+		// PHASE 1: Listen for the ACK until right before the next tick. 
+		// WaitForSingleObject with a timeout acts as both a sleep and an event listener. 
+		// If inference completes before the tick, results are immediately offloaded and the slot goes IDLE.
 		for (;;) {
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= next_trigger_time - kSpinWindow) break;
@@ -467,12 +500,12 @@ void controlPointThreadFunc(int i)
 			const DWORD timeoutMs = static_cast<DWORD>(std::max<long long>(1, remaining.count()));
 
 			if (WaitForSingleObject(hControlPointResults[i], timeoutMs) != WAIT_OBJECT_0) {
-				continue;   // timeout: ricontrolla quanto manca al tick
+				continue;   // Timeout: re-check time until tick
 			}
 			const auto ackTime = std::chrono::steady_clock::now();
 
 			InferenceState prevState = InferenceState::IDLE;
-			InferenceType  prevType = g_inferenceType;
+			InferenceType  prevType = cfg.inferenceType;
 			wchar_t        jsonCopy[1024] = { 0 };
 			long long      waitUs = 0;
 			const std::string ackedFilename = lastSentFilename;
@@ -486,10 +519,10 @@ void controlPointThreadFunc(int i)
 					prevState = InferenceState::RESULT_READY;
 					prevType = cpListMMF->points[i].inferenceType;
 					memcpy(jsonCopy, cpListMMF->points[i].results.json, sizeof(jsonCopy));
-					// Timer fermato SOLO su risultato valido.
+					// The timer is exclusively halted upon receiving a valid result.
 					waitUs = std::chrono::duration_cast<std::chrono::microseconds>(
 						ackTime - triggerTime).count();
-					// MMF scaricata: lo slot torna libero per il prossimo push.
+					// MMF is unloaded, freeing the slot for the upcoming push.
 					cpListMMF->points[i].results.state = InferenceState::IDLE;
 				}
 				ReleaseMutex(hControlPointMutex[i]);
@@ -500,25 +533,25 @@ void controlPointThreadFunc(int i)
 		}
 		if (!keepRunning) break;
 
-		// Spin finale: precisione al microsecondo sull'istante del tick.
+		// Final spin-wait loop ensures microsecond precision for the exact tick instant.
 		while (std::chrono::steady_clock::now() < next_trigger_time) {
 			YieldProcessor();
 		}
 
 		const auto now = std::chrono::steady_clock::now();
 		next_trigger_time += hardwareTriggerInterval;
-		// Tick persi per risveglio in ritardo >= 1 intervallo intero: saltati,
-		// non recuperati in raffica (una camera reale non emette mai due
-		// trigger back-to-back). Sono ritardi del simulatore, non dell'AI.
+		// Ticks missed due to wakeups delayed by >= 1 full interval are skipped, 
+		// not recovered in bursts. This mimics real cameras, which do not emit 
+		// back-to-back triggers. These measure simulator latency, not AI latency.
 		while (next_trigger_time <= now) {
 			next_trigger_time += hardwareTriggerInterval;
 			stats.missedTicks++;
 		}
 
-		// FASE 2: tick del frame grabber, tentativo di push
+		// PHASE 2: Frame grabber tick and push attempt.
 		bool frameDropped = false;
 		InferenceState prevState = InferenceState::IDLE;
-		InferenceType  prevType = g_inferenceType;
+		InferenceType  prevType = cfg.inferenceType;
 		wchar_t        jsonCopy[1024] = { 0 };
 		long long      waitUs = 0;
 		const std::string ackedFilename = lastSentFilename;
@@ -530,16 +563,14 @@ void controlPointThreadFunc(int i)
 				keepRunning = false;
 			}
 			else if (cpListMMF->points[i].results.state == InferenceState::PENDING) {
-				// L'inferenza del frame precedente non ha ancora finito: la
-				// telecamera non puo' consegnare il frame, drop.
+				// Previous frame inference is still pending. A new frame cannot be delivered, resulting in a drop.
 				stats.frameDrops++;
 				frameDropped = true;
 			}
 			else
 			{
-				// Stato IDLE (risultato gia' scaricato in fase 1) oppure
-				// RESULT_READY (arrivato a ridosso del tick, non ancora
-				// scaricato): in quel caso lo si copia PRIMA del push.
+				// State is either IDLE (result already unloaded in Phase 1) or RESULT_READY 
+				// (arrived near the tick, not yet unloaded). In the latter case, data is copied BEFORE the push.
 				prevState = cpListMMF->points[i].results.state;
 				prevType = cpListMMF->points[i].inferenceType;
 				if (prevState == InferenceState::RESULT_READY) {
@@ -570,7 +601,10 @@ void controlPointThreadFunc(int i)
 	if (hMMFResImage) CloseHandle(hMMFResImage);
 
 	if (stats.acksReceived == 0) stats.minWaitUs = 0;
-	g_stats.emplace_back(stats);   // la join in wmain sincronizza la lettura
+	// Writing by index. Using emplace_back from multiple threads on the same vector 
+	// causes a data race (concurrent reallocation). The vector is pre-sized in Start(), 
+	// and wmain's join synchronizes the read.
+	g_stats[i] = stats;
 
 	LOG("Thread {} stopped! (frames sent: {}, results: {}, frame drops: {}, missed ticks: {})\n",
 		i, stats.framesSent, stats.acksReceived, stats.frameDrops, stats.missedTicks);
@@ -629,6 +663,7 @@ void Start()
 		return;
 	}
 	isStarted = true;
+	g_stats.assign(num_control_points, WaitStats{});
 	for (int i = 0; i < num_control_points; i++)
 	{
 		threads.emplace_back(std::thread(controlPointThreadFunc, i));
@@ -682,10 +717,19 @@ void createEvent(HANDLE& hEvent, int i, const std::wstring& suffix) {
 }
 
 // Helper functions to read valid integer input with validation
+// Prompts intentionally bypass the async logger, otherwise they would appear after 
+// std::cin consumes the input. Direct write + flush is thread-safe here because 
+// Configure() runs on the main thread before control point threads start.
+static void PROMPT(const std::string& text) {
+	logger().flush();   // Flushes pending output BEFORE writing the prompt
+	fmt::print("{}", text);
+	fflush(stdout);
+}
+
 int readInt(const std::string& prompt, int minVal, int maxVal) {
 	int value;
 	while (true) {
-		LOG("{}", prompt);
+		PROMPT(prompt);
 		if (std::cin >> value) {
 			if (value >= minVal && value <= maxVal) {
 				std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
@@ -702,7 +746,7 @@ int readInt(const std::string& prompt, int minVal, int maxVal) {
 std::string readString(const std::string& prompt) {
 	std::string input;
 	while (true) {
-		LOG("{}", prompt);
+		PROMPT(prompt);
 		std::getline(std::cin, input);
 		if (!input.empty()) {
 			return input;
@@ -738,13 +782,40 @@ bool Configure()
 		cpListMMF->numPunti = num_control_points;
 		DWORD nRand = rand();
 
+		g_cpConfigs.assign(num_control_points, ControlPointConfig{});
+
 		for (int i = 0; i < num_control_points; i++)
 		{
-			std::string model_path = readString("Insert model path: ");
-			std::string dataset_path = readString("Insert dataset folder: ");
+			PROMPT(fmt::format("\n--- Control point {} / {} ---\n", i + 1, num_control_points));
 
-			int sizeX = readInt("Insert size x: ", 0, INT_MAX);
-			int sizeY = readInt("Insert size y: ", 0, INT_MAX);
+			// MODEL: Validates point-specific path for length (MMF field is TCHAR[512]) and existence.
+			std::wstring wModelPath;
+			while (true) {
+				std::string model_path = readString("Insert model path (.onnx): ");
+				wModelPath = stringToWstring(model_path);
+				if (wModelPath.length() >= 512) {
+					LOGE("### ERROR: model path exceeds 511 characters.\n");
+					continue;
+				}
+				if (!std::filesystem::is_regular_file(wModelPath)) {
+					LOGE("### WARNING: model file not found: {}\n", model_path);
+				}
+				break;
+			}
+
+			// DATASET: Point-specific input folder validation.
+			std::filesystem::path inputFolder;
+			while (true) {
+				std::string dataset_path = readString("Insert dataset folder: ");
+				inputFolder = std::filesystem::path(dataset_path);
+				if (!std::filesystem::is_directory(inputFolder)) {
+					LOGE("### WARNING: input folder does not exist or is not a directory: {}\n", dataset_path);
+				}
+				break;
+			}
+
+			int sizeX = readInt("Insert size x: ", 1, INT_MAX);
+			int sizeY = readInt("Insert size y: ", 1, INT_MAX);
 			int bpp = readInt("Insert bpp: ", 1, 64);
 			int inferenceType = readInt("Insert inference type (0: ANOMALY, 1: CLASSIFICATION, 2: OBJECT_DETECTION): ", 0, 2);
 
@@ -753,7 +824,6 @@ bool Configure()
 			cpListMMF->points[i].sizeY = sizeY;
 			cpListMMF->points[i].bpp = bpp;
 
-			std::wstring wModelPath = stringToWstring(model_path);
 			wcscpy_s(cpListMMF->points[i].pathModello, 512, wModelPath.c_str());
 
 			swprintf_s(cpListMMF->points[i].mutexName, 128, TEXT("CP_%lu_MUTEX"), cpListMMF->points[i].idPunto);
@@ -778,7 +848,15 @@ bool Configure()
 				LOGE("### ERROR: Invalid inference type for control point {}. Must be 0, 1, or 2.\n", i);
 				break;
 			}
-			
+
+			// Simulator-side copy. The control point thread reads the dataset and analysis type from here, keeping the MMF untouched.
+			g_cpConfigs[i].inputFolder = std::move(inputFolder);
+			g_cpConfigs[i].modelPath = wModelPath;
+			g_cpConfigs[i].inferenceType = cpListMMF->points[i].inferenceType;
+			g_cpConfigs[i].sizeX = sizeX;
+			g_cpConfigs[i].sizeY = sizeY;
+			g_cpConfigs[i].bpp = bpp;
+
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
@@ -864,166 +942,92 @@ bool isQuitRequested()
 	return quit;
 }
 
-// QuickEdit (conhost): un click nella finestra entra in modalita' selezione e
-// congela le scritture su console; i tasti vanno alla selezione, non a _getch.
-// Il processo sembra "bloccato" finche' non si preme ESC/Invio. Disattivarlo
-// rende il freeze impossibile. ENABLE_EXTENDED_FLAGS e' obbligatorio, senza
-// di esso la modifica a QUICK_EDIT viene ignorata.
+// QuickEdit (conhost) mode disable. Left-clicking normally freezes console writes as it 
+// enters selection mode. Disabling it removes the risk of artificial freezes. 
+// ENABLE_EXTENDED_FLAGS is required for the change to stick.
 static void DisableQuickEditMode() {
 	HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
 	if (hIn == NULL || hIn == INVALID_HANDLE_VALUE) return;
 	DWORD mode = 0;
-	if (!GetConsoleMode(hIn, &mode)) return;   // stdin non e' una console
+	if (!GetConsoleMode(hIn, &mode)) return;   // Stream redirected to file/pipe: not a console
 	mode &= ~ENABLE_QUICK_EDIT_MODE;
 	mode |= ENABLE_EXTENDED_FLAGS;
 	SetConsoleMode(hIn, mode);
 }
 
-// Parse the analysis type argument: accepts the enum name (case-insensitive) or its numeric value
-bool parseInferenceType(std::wstring value, InferenceType& outType)
+// Parses an integer command line argument. Returns false and logs an error if the value is not an integer or is out of bounds.
+static bool parseIntArg(const wchar_t* raw, const char* what, int minVal, int maxVal, int& out)
 {
-	std::transform(value.begin(), value.end(), value.begin(), ::towlower);
-
-	if (value == L"anomaly" || value == L"0") {
-		outType = InferenceType::ANOMALY;
+	try {
+		size_t consumed = 0;
+		const std::wstring s(raw);
+		const int value = std::stoi(s, &consumed);
+		if (consumed != s.size()) throw std::invalid_argument("trailing characters");
+		if (value < minVal || value > maxVal) {
+			LOGE("### ERROR: {} must be between {} and {} (got {}).\n", what, minVal, maxVal, value);
+			return false;
+		}
+		out = value;
+		return true;
 	}
-	else if (value == L"classification" || value == L"1") {
-		outType = InferenceType::CLASSIFICATION;
-	}
-	else if (value == L"object_detection" || value == L"objectdetection" || value == L"2") {
-		outType = InferenceType::OBJECT_DETECTION;
-	}
-	else {
+	catch (const std::exception&) {
+		LOGE("### ERROR: invalid {} value: '{}'. Must be an integer.\n", what, ToNarrow(raw));
 		return false;
 	}
-	return true;
 }
 
 int wmain(int argc, wchar_t* argv[])
 {
-	// Va fatto PRIMA di qualunque stampa: elimina i freeze da click accidentale
-	// e attiva l'interpretazione delle sequenze ANSI dei colori.
+	// Terminal configurations applied PRIOR to any printing. Eliminates accidental 
+	// click freezes and enables ANSI color sequences.
 	DisableQuickEditMode();
 	EnableVTProcessing();
 
-	// Alza la risoluzione del timer di sistema a 1 ms per TUTTA la durata del
-	// processo: migliora la granularita' sia degli sleep sia dei timeout di
-	// WaitForSingleObject usati per attendere il tick del frame grabber.
+	// Increases system timer resolution to 1 ms for the ENTIRE process lifetime. 
+	// This improves the granularity of both sleeps and WaitForSingleObject timeouts 
+	// used for frame grabber ticks.
 	timeBeginPeriod(1);
 
-	// Il processo ONNX gira in REALTIME_PRIORITY_CLASS con thread in spin:
-	// senza alzare anche la nostra classe, il thread trigger viene starvato e
-	// ogni risveglio in ritardo diventa un falso frame drop. HIGH (non
-	// REALTIME: non serve battere l'AI, basta battere i processi normali,
-	// e due processi REALTIME in competizione peggiorano entrambi).
+	// The ONNX process runs in REALTIME_PRIORITY_CLASS with spinning threads. 
+	// Upgrading this process class to HIGH prevents the trigger thread from starving, 
+	// avoiding false frame drops.
 	if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
 		LOGE("### WARNING: SetPriorityClass(HIGH) failed ({})\n", GetLastError());
 	}
 
 	LOG("DELTA VISIONE - Test AI via MMF + ONNX!\n");
 
-	// Optional positional arguments; defaults defined at the top of the file
-	// Usage: ConsoleApplicationTestAI.exe [inputFolder] [modelPath] [anomaly|classification|object_detection] [frameRateMs] [triggerCore]
-	// triggerCore: logical core (0-based) where the trigger thread is pinned.
-	// Pick a core OUTSIDE the ONNX slice (see the ONNX startup log); -1 = no pin.
-	if (argc > 1) {
-		g_inputFolder = argv[1];
+	// Optional positional arguments (all integers). 
+	// Model, dataset, and geometry are now per-control-point and requested during Configure().
+	// Usage: ConsoleApplicationTestAI.exe [frameRateMs] [numControlPoints] [triggerCore]. 
+	// triggerCore designates the logical core for trigger threads. It should be kept OUTSIDE the ONNX slice. -1 disables pinning.
+	if (argc > 1 && !parseIntArg(argv[1], "frame rate (ms)", 1, INT_MAX, frameRate_milliseconds)) {
+		logger().stop();
+		timeEndPeriod(1);
+		return 1;
 	}
-	if (argc > 2) {
-		g_modelPath = argv[2];
-		if (g_modelPath.length() >= 512) {
-			LOGE("### ERROR: model path exceeds 511 characters.\n");
-			logger().stop();
-			timeEndPeriod(1);
-			return 1;
-		}
+	if (argc > 2 && !parseIntArg(argv[2], "number of control points", 1, 1024, num_control_points)) {
+		logger().stop();
+		timeEndPeriod(1);
+		return 1;
 	}
-	if (argc > 3) {
-		if (!parseInferenceType(argv[3], g_inferenceType)) {
-			LOGE("### ERROR: unknown analysis type '{}'. Valid values: anomaly (0), classification (1), object_detection (2).\n",
-				ToNarrow(argv[3]));
-			logger().stop();
-			timeEndPeriod(1);
-			return 1;
-		}
+	if (argc > 3 && !parseIntArg(argv[3], "trigger core", -1, 63, g_triggerCore)) {
+		logger().stop();
+		timeEndPeriod(1);
+		return 1;
 	}
-
 	if (argc > 4) {
-		try {
-			frameRate_milliseconds = std::stoi(argv[4]);
-			if (frameRate_milliseconds <= 0) {
-				LOGE("### ERROR: frame rate must be a positive number of milliseconds.\n");
-				logger().stop();
-				timeEndPeriod(1);
-				return 1;
-			}
-		}
-		catch (const std::exception&) {
-			LOGE("### ERROR: invalid frame rate value: '{}'. Must be an integer.\n", ToNarrow(argv[4]));
-			logger().stop();
-			timeEndPeriod(1);
-			return 1;
-		}
+		LOGE("### WARNING: extra arguments ignored. Usage: {} [frameRateMs] [numControlPoints] [triggerCore]\n",
+			ToNarrow(argv[0]));
 	}
 
-	if (argc > 5) {
-		try {
-			g_triggerCore = std::stoi(argv[5]);
-			if (g_triggerCore > 63) {
-				LOGE("### ERROR: trigger core must be < 64.\n");
-				logger().stop();
-				timeEndPeriod(1);
-				return 1;
-			}
-		}
-		catch (const std::exception&) {
-			LOGE("### ERROR: invalid trigger core value: '{}'. Must be an integer (-1 = no pin).\n", ToNarrow(argv[5]));
-			logger().stop();
-			timeEndPeriod(1);
-			return 1;
-		}
-	}
-
-	if (argc > 6) {
-		try {
-			num_control_points = std::stoi(argv[6]);
-			if (num_control_points <= 0) {
-				LOGE("### ERROR: number of control points must be a positive number of milliseconds.\n");
-				logger().stop();
-				timeEndPeriod(1);
-				return 1;
-			}
-		}
-		catch (const std::exception&) {
-			LOGE("### ERROR: invalid number of control points value: '{}'. Must be an integer.\n", ToNarrow(argv[6]));
-			logger().stop();
-			timeEndPeriod(1);
-			return 1;
-		}
-	}
-
-
-
-	if (!std::filesystem::is_directory(g_inputFolder)) {
-		LOGE("### WARNING: input folder does not exist or is not a directory: {}\n", g_inputFolder.string());
-	}
-	if (!std::filesystem::is_regular_file(g_modelPath)) {
-		LOGE("### WARNING: model file not found: {}\n", ToNarrow(g_modelPath));
-	}
-
-	LOG(">> Input folder : {}\n"
-		">> Model path   : {}\n"
-		">> Analysis type: {}\n"
-		">> Trigger rate : {} ms\n"
+	LOG(">> Trigger rate : {} ms\n"
+		">> Control pts  : {}\n"
 		">> Trigger core : {}\n"
-		">> Control pts  : {}\n\n",
-		g_inputFolder.string(),
-		ToNarrow(g_modelPath),
-		g_inferenceType == InferenceType::ANOMALY ? "ANOMALY" :
-		g_inferenceType == InferenceType::CLASSIFICATION ? "CLASSIFICATION" : "OBJECT_DETECTION",
+		">> Model/dataset/size/type: per control point, chiesti con 'c'\n\n",
 		frameRate_milliseconds,
-		g_triggerCore >= 0 ? std::to_string(g_triggerCore) : "not pinned",
-		num_control_points);
+		num_control_points,
+		g_triggerCore >= 0 ? std::to_string(g_triggerCore) : "not pinned");
 
 	srand(1792);
 
@@ -1103,9 +1107,8 @@ int wmain(int argc, wchar_t* argv[])
 		}
 		DWORD resWait = WaitForSingleObject(hListMutex, 100);
 		switch (resWait) {
-			// Su WAIT_ABANDONED il thread possiede comunque il mutex: va gestito
-			// come WAIT_OBJECT_0 (isQuitRequested lo rilascia), altrimenti il
-			// mutex resta acquisito per sempre e l'altro processo si blocca.
+			// WAIT_ABANDONED still grants mutex ownership. It is handled like WAIT_OBJECT_0 
+			// (released by isQuitRequested) to prevent indefinite lockups in the interacting process.
 		case WAIT_ABANDONED:
 		case WAIT_OBJECT_0:
 		{
@@ -1171,8 +1174,8 @@ int wmain(int argc, wchar_t* argv[])
 			const WaitStats& s = g_stats[i];
 			totalDrops += s.frameDrops;
 			totalSent += s.framesSent;
-			// frame drops  = inferenza ancora PENDING al tick (colpa dell'AI)
-			// missed ticks = risveglio del simulatore in ritardo >= 1 intervallo (colpa nostra)
+			// frame drops  = AI inference was still PENDING at the tick (AI bottleneck)
+			// missed ticks = simulator woke up >= 1 interval late (Simulator bottleneck)
 			LOG("CP {} | frames sent: {:6} | results: {:6} | frame drops: {} | missed ticks (sim late): {}\n"
 				"CP {} | ack wait (trigger -> RESULT_READY) min: {:.3f} ms | avg: {:.3f} ms | max: {:.3f} ms\n",
 				i, s.framesSent, s.acksReceived, s.frameDrops, s.missedTicks,
@@ -1183,21 +1186,10 @@ int wmain(int argc, wchar_t* argv[])
 		LOG("=======================================================\n");
 	}
 
-	// Smaltisce coda e ferma il logger PRIMA di ripristinare il timer e uscire,
-	// cosi' il summary viene effettivamente stampato prima della terminazione.
+	// Flushes the queue and stops the logger BEFORE restoring the system timer and exiting. 
+	// This guarantees the summary is fully printed before termination.
 	logger().stop();
 
-	// Ripristina la risoluzione del timer di sistema.
+	// Restores the system timer resolution.
 	timeEndPeriod(1);
 }
-
-// Per eseguire il programma: CTRL+F5 oppure Debug > Avvia senza eseguire debug
-// Per eseguire il debug del programma: F5 oppure Debug > Avvia debug
-
-// Suggerimenti per iniziare: 
-//   1. Usare la finestra Esplora soluzioni per aggiungere/gestire i file
-//   2. Usare la finestra Team Explorer per connettersi al controllo del codice sorgente
-//   3. Usare la finestra di output per visualizzare l'output di compilazione e altri messaggi
-//   4. Usare la finestra Elenco errori per visualizzare gli errori
-//   5. Passare a Progetto > Aggiungi nuovo elemento per creare nuovi file di codice oppure a Progetto > Aggiungi elemento esistente per aggiungere file di codice esistenti al progetto
-//   6. Per aprire di nuovo questo progetto in futuro, passare a File > Apri > Progetto e selezionare il file con estensione sln
