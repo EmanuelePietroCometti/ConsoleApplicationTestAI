@@ -681,6 +681,44 @@ void createEvent(HANDLE& hEvent, int i, const std::wstring& suffix) {
 	}
 }
 
+// Helper functions to read valid integer input with validation
+int readInt(const std::string& prompt, int minVal, int maxVal) {
+	int value;
+	while (true) {
+		LOG("{}", prompt);
+		if (std::cin >> value) {
+			if (value >= minVal && value <= maxVal) {
+				std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+				return value;
+			}
+		}
+		LOGE("### ERROR: invalid input. Insert value between {} and {}.\n", minVal, maxVal);
+		std::cin.clear();
+		std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+	}
+}
+
+// Helper function to read a non-empty string from user input
+std::string readString(const std::string& prompt) {
+	std::string input;
+	while (true) {
+		LOG("{}", prompt);
+		std::getline(std::cin, input);
+		if (!input.empty()) {
+			return input;
+		}
+		LOGE("### ERROR: invalid input. Value can not be empty.\n");
+	}
+}
+
+std::wstring stringToWstring(const std::string& str) {
+	if (str.empty()) return std::wstring();
+	int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+	std::wstring wstrTo(size_needed, 0);
+	MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+	return wstrTo;
+}
+
 bool Configure()
 {
 	bool isConfigured = false;
@@ -702,12 +740,21 @@ bool Configure()
 
 		for (int i = 0; i < num_control_points; i++)
 		{
-			cpListMMF->points[i].idPunto = nRand + i;
-			cpListMMF->points[i].sizeX = 512;
-			cpListMMF->points[i].sizeY = 512;
-			cpListMMF->points[i].bpp = 24;
+			std::string model_path = readString("Insert model path: ");
+			std::string dataset_path = readString("Insert dataset folder: ");
 
-			wcscpy_s(cpListMMF->points[i].pathModello, 512, g_modelPath.c_str());
+			int sizeX = readInt("Insert size x: ", 0, INT_MAX);
+			int sizeY = readInt("Insert size y: ", 0, INT_MAX);
+			int bpp = readInt("Insert bpp: ", 1, 64);
+			int inferenceType = readInt("Insert inference type (0: ANOMALY, 1: CLASSIFICATION, 2: OBJECT_DETECTION): ", 0, 2);
+
+			cpListMMF->points[i].idPunto = nRand + i;
+			cpListMMF->points[i].sizeX = sizeX;
+			cpListMMF->points[i].sizeY = sizeY;
+			cpListMMF->points[i].bpp = bpp;
+
+			std::wstring wModelPath = stringToWstring(model_path);
+			wcscpy_s(cpListMMF->points[i].pathModello, 512, wModelPath.c_str());
 
 			swprintf_s(cpListMMF->points[i].mutexName, 128, TEXT("CP_%lu_MUTEX"), cpListMMF->points[i].idPunto);
 			swprintf_s(cpListMMF->points[i].eventReadyName, 128, TEXT("CP_%lu_EVENTREADY"), cpListMMF->points[i].idPunto);
@@ -717,7 +764,21 @@ bool Configure()
 			createEvent(hControlPointEvent[i], i, L"EVENTREADY");
 			createEvent(hControlPointResults[i], i, L"EVENTRESULTS");
 
-			cpListMMF->points[i].inferenceType = g_inferenceType;
+			switch (inferenceType) {
+			case 0:
+				cpListMMF->points[i].inferenceType = InferenceType::ANOMALY;
+				break;
+			case 1:
+				cpListMMF->points[i].inferenceType = InferenceType::CLASSIFICATION;
+				break;
+			case 2:
+				cpListMMF->points[i].inferenceType = InferenceType::OBJECT_DETECTION;
+				break;
+			default:
+				LOGE("### ERROR: Invalid inference type for control point {}. Must be 0, 1, or 2.\n", i);
+				break;
+			}
+			
 			cpListMMF->points[i].status = PointState::UPDATE_PENDING;
 		}
 
